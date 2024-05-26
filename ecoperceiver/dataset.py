@@ -6,17 +6,20 @@ import json
 import pickle as pkl
 from torch.utils.data import Dataset
 
-class FluxDataset(Dataset):
+class EcoPerceiverDataset(Dataset):
+    '''
+    Note:
+      If you specify multiple targets, the dataloader will only provide rows
+      where all targets are non-null.
+    '''
     def __init__(
-            self, data_dir, sites, context_length=48,
-            target='NEE_VUT_REF'
+            self, data_dir, sites, context_length=48, targets=['NEE_VUT_REF']
             ):
         self.data_dir = data_dir
         self.sites = sites
         self.data = []
         self.context_length = context_length
-
-        self.target = target
+        self.targets = targets
         
         for root, _, files in os.walk(self.data_dir):
             in_sites = False
@@ -26,51 +29,40 @@ class FluxDataset(Dataset):
             if not in_sites:
                 continue
 
-            if 'data.csv' in files:
-                df = pd.read_csv(os.path.join(root, 'data.csv'))
-
-                float_cols = [c for c in df.columns if c != 'timestamp']
-                df[float_cols] = df[float_cols].astype(np.float32)
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
-                with open(os.path.join(root, 'modis.pkl'), 'rb') as f:
-                    modis_data = pkl.load(f)
+            if 'meta.json' in files:
                 with open(os.path.join(root, 'meta.json'), 'r') as f:
                     meta = json.load(f)
+                
+                target_df = pd.read_csv(os.path.join(root, 'targets.csv'), usecols=['timestamp'] + self.targets)
+                pred_df = pd.read_csv(os.path.join(root, 'predictors.csv'))
+                for df in [target_df, pred_df]:
+                    float_cols = [c for c in df.columns if c != 'timestamp']
+                    df[float_cols] = df[float_cols].astype(np.float32)
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                
+                with open(os.path.join(root, 'modis.pkl'), 'rb') as f:
+                    modis_data = pkl.load(f)
 
-                self.data.append((meta, df, modis_data))
+                self.data.append((meta, pred_df, modis_data, target_df))
 
-        self.create_lookup_table()
+        # Create lookup table
         self.lookup_table = []
         for i, d in enumerate(self.data):
-            _, df, _ = d
-            for r in range(self.context_length, len(df)+1):
-                if 
-                self.lookup_table.append((i,r))
-    
-    def create_lookup_table(self):
-        self.lookup_table = []
-        for i, data_tuple in enumerate(self.data):
-            _, df, _ = data_tuple
-            for r in range(self.context_length, len(df)+1):
-                self.lookup_table.append((i,r))
+            _, _, _, target_df = d
+            condition = (target_df.index > self.context_length - 1)
+            for t in self.targets:
+                condition &= (target_df[t].notnull())
+            self.lookup_table.extend([(i, r) for r in target_df[condition].index.tolist()])
 
 
     def num_channels(self):
         # returns number of frequency bands in the imagery
-        _, _, modis = self.data[0]
+        _, _, modis, _ = self.data[0]
         return modis[list(modis.keys())[0]].shape[0]
     
     def columns(self):
         _, labels, _, _, _ = self.__getitem__(0)
         return labels
-    
-    def mask_targets(self, prev_targets):
-        # Add targets to predictors, but only a random number of them to simulate cold starts
-        prev_mask = torch.zeros(prev_targets.shape).to(torch.bool)
-        n = np.random.randint(0, len(prev_targets))
-        prev_mask[-1:] = True
-        prev_mask[:n] = True
-        return prev_mask | prev_targets.isnan()
 
     def __len__(self):
         return len(self.lookup_table)
@@ -79,31 +71,32 @@ class FluxDataset(Dataset):
         site_num, row_max = self.lookup_table[idx]
         row_min = row_max - (self.context_length)
 
-        _, df, modis = self.data[site_num]
-        rows = df.iloc[row_min:row_max]
+        _, pred_df, modis_data, target_df = self.data[site_num]
+        pred_rows = pred_df.iloc[row_min+1:row_max+1].reset_index(drop=True)
+        target_rows = target_df.iloc[row_min+1:row_max+1].reset_index(drop=True)
 
-        rows = rows.reset_index(drop=True)
-        modis_data = []
-        timestamps = list(rows['timestamp'])
+        modis_imgs = []
+        timestamps = list(pred_rows['timestamp'])
+
         for i, ts in enumerate(timestamps):
-            pixels = modis.get(ts, None)
+            pixels = modis_data.get(ts, None)
             if pixels is not None:
-                modis_data.append((i, torch.tensor(pixels[:,1:9,1:9], dtype=torch.float32)))
+                modis_imgs.append((i, torch.tensor(pixels[:,1:9,1:9], dtype=torch.float32)))
         
-        predictor_df = rows.drop(columns=self.remove_columns)
-        labels = list(predictor_df.columns)
-        target_df = rows[self.target_columns]
+        pred_rows = pred_rows.drop(columns=['timestamp'])
+        target_rows = target_rows.drop(columns=['timestamp'])
+        labels = list(pred_rows.columns)
         
-        predictors = torch.tensor(predictor_df.values)
+        predictors = torch.tensor(pred_rows.values)
         mask = predictors.isnan()
         predictors = predictors.nan_to_num(-1.0) # just needs a numeric value, doesn't matter what
 
-        targets = torch.tensor(target_df.values[-1:])
-        return predictors, labels, mask, modis_data, targets
+        targets = torch.tensor(target_rows.values[-1:])
+        return predictors, labels, mask, modis_imgs, targets
 
 
-def custom_collate_fn(batch):
-    predictors, labels, mask, modis_data, targets = zip(*batch)
+def ep_collate(batch):
+    predictors, labels, mask, modis_imgs, targets = zip(*batch)
     # Normal attributes
     predictors = torch.stack(predictors, dim=0)
     mask = torch.stack(mask, dim=0)
@@ -112,12 +105,11 @@ def custom_collate_fn(batch):
     for l in labels[1:]:
         np.testing.assert_array_equal(labels[0], l, f'Difference found in input arrays {labels[0]} and {l}')
     labels = labels[0]
-
     # List of modis data. Tuples of (batch, timestep, data)
     modis_list = []
-    for b, batch in enumerate(modis_data):
+    for b, batch in enumerate(modis_imgs):
         for t, data in batch:
             modis_list.append((b, t, data))
-    modis_data = modis_list
+    modis_imgs = modis_list
 
-    return predictors, labels, mask, modis_data, targets
+    return predictors, labels, mask, modis_imgs, targets

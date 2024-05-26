@@ -1,14 +1,14 @@
 import torch
 from typing import Tuple
 from torch import nn
-import components as vc
+from .components import AttentionLayer
 from dataclasses import dataclass
 from einops import rearrange
 torch.manual_seed(0)
 
 
 @dataclass
-class PerceiverConfig():
+class EcoPerceiverConfig():
     latent_hidden_dim: int = 256
     input_embedding_dim: int = 128
     tabular_inputs: Tuple = ()
@@ -39,8 +39,8 @@ class FourierFeatureMapping(nn.Module):
         return torch.cat([sin_emb, cos_emb], dim=-1)
 
 
-class Perceiver(nn.Module):
-    def __init__(self, config: PerceiverConfig):
+class EcoPerceiverModel(nn.Module):
+    def __init__(self, config: EcoPerceiverConfig):
         super().__init__()
         self.config = config
         self.input_embeddings = nn.Embedding(len(self.config.tabular_inputs), self.config.input_embedding_dim)
@@ -67,8 +67,8 @@ class Perceiver(nn.Module):
         layers = []
         if self.config.weight_sharing:
             cross_attention_block = [
-                vc.AttentionLayer(latent_hidden_dim, config.num_heads, config.mlp_ratio, kv_hidden_size=self.input_hidden_dim),
-                vc.AttentionLayer(latent_hidden_dim, config.num_heads, config.mlp_ratio)
+                AttentionLayer(latent_hidden_dim, config.num_heads, config.mlp_ratio, kv_hidden_size=self.input_hidden_dim),
+                AttentionLayer(latent_hidden_dim, config.num_heads, config.mlp_ratio)
             ]
             for i in range(len(self.layer_types)//2):
                 block_type = self.layer_types[i*2:(i+1)*2]
@@ -76,19 +76,19 @@ class Perceiver(nn.Module):
                     layers.extend(cross_attention_block)
                 else:
                     layers.extend([
-                        vc.AttentionLayer(latent_hidden_dim, config.num_heads, config.mlp_ratio),
-                        vc.AttentionLayer(latent_hidden_dim, config.num_heads, config.mlp_ratio)
+                        AttentionLayer(latent_hidden_dim, config.num_heads, config.mlp_ratio),
+                        AttentionLayer(latent_hidden_dim, config.num_heads, config.mlp_ratio)
                     ])
             
         else:
             for l in self.layer_types:
                 if l == 'c':
                     layers.append(
-                        vc.AttentionLayer(latent_hidden_dim, config.num_heads, config.mlp_ratio, kv_hidden_size=self.input_hidden_dim)
+                        AttentionLayer(latent_hidden_dim, config.num_heads, config.mlp_ratio, kv_hidden_size=self.input_hidden_dim)
                     )
                 elif l == 's':
                     layers.append(
-                        vc.AttentionLayer(config.latent_hidden_dim, config.num_heads, config.mlp_ratio)
+                        AttentionLayer(config.latent_hidden_dim, config.num_heads, config.mlp_ratio)
                     )
 
         self.layers = nn.ModuleList(layers)
