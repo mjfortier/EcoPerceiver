@@ -66,12 +66,21 @@ class EcoPerceiverDataset(Dataset):
 
     def __len__(self):
         return len(self.lookup_table)
+    
+    def get_target_dataframe(self):
+        target_dfs = []
+        for meta, _, _, target_df in self.data:
+            target_copy = target_df.copy()
+            target_copy['SITE_ID'] = meta['SITE_ID']
+            target_copy['Inferred'] = np.nan
+            target_dfs.append(target_copy[['SITE_ID', 'timestamp'] + self.targets + ['Inferred']])
+        return pd.concat(target_dfs, axis=0)
 
     def __getitem__(self, idx):
         site_num, row_max = self.lookup_table[idx]
         row_min = row_max - (self.context_length)
 
-        _, pred_df, modis_data, target_df = self.data[site_num]
+        meta, pred_df, modis_data, target_df = self.data[site_num]
         pred_rows = pred_df.iloc[row_min+1:row_max+1].reset_index(drop=True)
         target_rows = target_df.iloc[row_min+1:row_max+1].reset_index(drop=True)
 
@@ -92,11 +101,11 @@ class EcoPerceiverDataset(Dataset):
         predictors = predictors.nan_to_num(-1.0) # just needs a numeric value, doesn't matter what
 
         targets = torch.tensor(target_rows.values[-1:])
-        return predictors, labels, mask, modis_imgs, targets
+        return predictors, labels, mask, modis_imgs, targets, meta['SITE_ID'], timestamps[-1]
 
 
 def ep_collate(batch):
-    predictors, labels, mask, modis_imgs, targets = zip(*batch)
+    predictors, labels, mask, modis_imgs, targets, site_ids, timestamps = zip(*batch)
     # Normal attributes
     predictors = torch.stack(predictors, dim=0)
     mask = torch.stack(mask, dim=0)
@@ -112,4 +121,4 @@ def ep_collate(batch):
             modis_list.append((b, t, data))
     modis_imgs = modis_list
 
-    return predictors, labels, mask, modis_imgs, targets
+    return predictors, labels, mask, modis_imgs, targets, site_ids, timestamps
