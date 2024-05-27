@@ -134,7 +134,7 @@ class EcoPerceiverModel(nn.Module):
         
         return img_data, img_map
 
-    def forward(self, predictors, labels, mask, spectral_data, fluxes):
+    def forward(self, batch):
         '''
         B - batch size
         L - sequence length
@@ -146,6 +146,12 @@ class EcoPerceiverModel(nn.Module):
         IH - total input dim (I + 2*F)
         H - latent hidden dim
         '''
+        predictors = batch['predictors']
+        labels = batch['predictor_labels']
+        mask = batch['predictor_mask']
+        spectral_data = batch['modis_imgs']
+        fluxes = batch['targets']
+
         device = self.input_embeddings.weight.device
 
         # Marshall data

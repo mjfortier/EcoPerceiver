@@ -61,7 +61,7 @@ class EcoPerceiverDataset(Dataset):
         return modis[list(modis.keys())[0]].shape[0]
     
     def columns(self):
-        _, labels, _, _, _ = self.__getitem__(0)
+        _, labels, _, _, _, _, _, _ = self.__getitem__(0)
         return labels
 
     def __len__(self):
@@ -94,26 +94,42 @@ class EcoPerceiverDataset(Dataset):
         
         pred_rows = pred_rows.drop(columns=['timestamp'])
         target_rows = target_rows.drop(columns=['timestamp'])
-        labels = list(pred_rows.columns)
+        predictor_labels = list(pred_rows.columns)
+        target_labels = list(target_rows.columns)
         
         predictors = torch.tensor(pred_rows.values)
-        mask = predictors.isnan()
+        predictor_mask = predictors.isnan()
         predictors = predictors.nan_to_num(-1.0) # just needs a numeric value, doesn't matter what
 
         targets = torch.tensor(target_rows.values[-1:])
-        return predictors, labels, mask, modis_imgs, targets, meta['SITE_ID'], timestamps[-1]
+        return (
+            predictors,
+            predictor_labels,
+            predictor_mask,
+            modis_imgs,
+            targets,
+            target_labels,
+            meta['SITE_ID'],
+            timestamps[-1]
+        )
 
 
 def ep_collate(batch):
-    predictors, labels, mask, modis_imgs, targets, site_ids, timestamps = zip(*batch)
+    predictors, predictor_labels, predictor_mask, modis_imgs, targets, target_labels, site_ids, timestamps = zip(*batch)
     # Normal attributes
     predictors = torch.stack(predictors, dim=0)
-    mask = torch.stack(mask, dim=0)
+    predictor_mask = torch.stack(predictor_mask, dim=0)
     targets = torch.stack(targets, dim=0)
 
-    for l in labels[1:]:
-        np.testing.assert_array_equal(labels[0], l, f'Difference found in input arrays {labels[0]} and {l}')
-    labels = labels[0]
+    # Make sure all labels match up
+    for l in predictor_labels[1:]:
+        np.testing.assert_array_equal(predictor_labels[0], l, f'Difference found in input arrays {predictor_labels[0]} and {l}')
+    predictor_labels = predictor_labels[0]
+
+    for l in target_labels[1:]:
+        np.testing.assert_array_equal(target_labels[0], l, f'Difference found in input arrays {target_labels[0]} and {l}')
+    target_labels = target_labels[0]
+
     # List of modis data. Tuples of (batch, timestep, data)
     modis_list = []
     for b, batch in enumerate(modis_imgs):
@@ -121,4 +137,13 @@ def ep_collate(batch):
             modis_list.append((b, t, data))
     modis_imgs = modis_list
 
-    return predictors, labels, mask, modis_imgs, targets, site_ids, timestamps
+    return {
+        'predictors': predictors,
+        'predictor_labels': predictor_labels,
+        'predictor_mask': predictor_mask,
+        'modis_imgs': modis_imgs,
+        'targets': targets,
+        'target_labels': target_labels,
+        'site_ids': site_ids,
+        'timestamps': timestamps,
+    }
