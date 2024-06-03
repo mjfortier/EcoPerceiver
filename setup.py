@@ -11,6 +11,10 @@ setup(
     url='https://github.com/mjfortier/EcoPerceiver',
     packages=find_packages(),
     install_requires=[
+        'numpy==1.24.3',
+        'pandas==2.0.1',
+        'torch==2.0',
+        'einops==0.6.1'
     ],
-    python_requires='>=3.8',
+    python_requires='>=3.9',
 )
