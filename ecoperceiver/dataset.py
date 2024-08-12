@@ -61,8 +61,11 @@ class EcoPerceiverDataset(Dataset):
 
     def num_channels(self):
         # returns number of frequency bands in the imagery
-        _, _, modis, _ = self.data[0]
-        return modis[list(modis.keys())[0]].shape[0]
+        if self.use_images:
+            _, _, modis, _ = self.data[0]
+            return modis[list(modis.keys())[0]].shape[0]
+        else:
+            return 7
     
     def columns(self):
         _, labels, _, _, _, _, _, _ = self.__getitem__(0)
