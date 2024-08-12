@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='ecoperceiver',
-    version='0.1.0',
+    version='0.1.1',
     author='Matthew Fortier',
     author_email='fortier.matt@gmail.com',
     description='A multimodal model and dataloader for carbon flux modelling',
