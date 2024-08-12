@@ -13,13 +13,14 @@ class EcoPerceiverDataset(Dataset):
       where all targets are non-null.
     '''
     def __init__(
-            self, data_dir, sites, context_length=48, targets=['NEE_VUT_REF']
+            self, data_dir, sites, context_length=48, targets=['NEE_VUT_REF'], use_images=True
             ):
         self.data_dir = data_dir
         self.sites = sites
         self.data = []
         self.context_length = context_length
         self.targets = targets
+        self.use_images = use_images
         
         for root, _, files in os.walk(self.data_dir):
             in_sites = False
@@ -40,8 +41,11 @@ class EcoPerceiverDataset(Dataset):
                     df[float_cols] = df[float_cols].astype(np.float32)
                     df['timestamp'] = pd.to_datetime(df['timestamp'])
                 
-                with open(os.path.join(root, 'modis.pkl'), 'rb') as f:
-                    modis_data = pkl.load(f)
+                if self.use_images:
+                    with open(os.path.join(root, 'modis.pkl'), 'rb') as f:
+                        modis_data = pkl.load(f)
+                else:
+                    modis_data = {}
 
                 self.data.append((meta, pred_df, modis_data, target_df))
 
