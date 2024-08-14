@@ -256,3 +256,133 @@ class EcoPerceiverModel(nn.Module):
     def loss(self, pred, target):
         loss = (pred - target) ** 2
         return loss.mean()
+
+
+class FauxVanillaModel(nn.Module):
+    def __init__(self, config: EcoPerceiverConfig):
+        super().__init__()
+        self.config = config
+        self.input_embeddings = nn.Embedding(len(self.config.tabular_inputs), self.config.input_embedding_dim)
+
+        self.fourier = FourierFeatureMapping(self.config.num_frequencies)
+        self.input_hidden_dim = self.config.input_embedding_dim + self.config.num_frequencies * 2
+        #self.obs_dropout = nn.Dropout(p=self.config.obs_dropout)
+
+        self.latent_hidden_dim = self.config.latent_hidden_dim
+        context_length = self.config.context_length
+
+        num_pixels = self.config.spectral_data_resolution[0] * self.config.spectral_data_resolution[1]
+        self.channels = self.config.spectral_data_channels # for brevity
+        self.spectral_projections = nn.ModuleList(
+            [nn.Linear(num_pixels, self.config.num_frequencies * 2) for _ in range(self.channels)]
+        )
+        self.spectral_embeddings = nn.Embedding(self.channels, self.config.input_embedding_dim)
+        self.hidden_proj = nn.Linear(self.input_hidden_dim, self.latent_hidden_dim)
+        self.layer_norm = nn.LayerNorm(self.latent_hidden_dim, eps=1e-12)
+
+        self.layer_types = self.config.layers
+        layers = []
+        for l in self.layer_types:
+            if l == 's':
+                layers.append(
+                    AttentionLayer(config.latent_hidden_dim, config.num_heads, config.mlp_ratio)
+                )
+
+        self.layers = nn.ModuleList(layers)
+        self.output_proj = nn.Linear(self.latent_hidden_dim, 1)
+        self.apply(self.initialize_weights)
+    
+    def initialize_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_normal_(module.weight)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.LayerNorm)):
+            nn.init.constant_(module.weight, 1)
+            nn.init.constant_(module.bias, 0)
+    
+
+    def forward(self, batch):
+        '''
+        B - batch size
+        L - sequence length (num_observations) ((1))
+        P - # of observations (input variables)
+        M - # of observations with images
+        F - # of frequencies
+        C - # of spectral channels
+        I - input embedding dim
+        IH - total input dim (I + 2*F)
+        H - latent hidden dim
+        '''
+        predictors = batch['predictors']
+        labels = batch['predictor_labels']
+        mask = batch['predictor_mask']
+        spectral_data = batch['modis_imgs']
+        fluxes = batch['targets']
+
+        device = self.input_embeddings.weight.device
+        # Marshall data
+        mask = mask.to(device)
+        doy_index = labels.index('DOY')
+        tod_index = labels.index('TOD')
+        mask[:,:,doy_index] = False
+        mask[:,:,tod_index] = False
+        
+        observations = predictors.to(device)
+        fluxes = fluxes.to(device)
+        # if len(spectral_data) == 0:
+        #     faux_spectral = torch.zeros(self.num_channels, 8, 8)
+        #     return self.forward_no_images(observations, mask, fluxes)
+
+        B, L, P = observations.shape
+        # spectral mask
+        spectral_mask = torch.ones(B, 1, 9).to(torch.bool)
+        spec_dict = {}
+        for i, s in enumerate(spectral_data):
+            spectral_mask[s[0],:,:] = False
+            spec_dict[i] = s[0]
+
+        spectral_mask = spectral_mask.to(device)
+        mask = torch.cat([mask, spectral_mask], dim=-1).unsqueeze(-2).repeat(1,1,30,1)
+        
+        spectral_values = torch.zeros(B, 9, self.config.num_frequencies * 2).to(device) # (B, L(1), C, 2*F)
+
+        if len(spectral_data) > 0:
+            imgs = []
+            for _, _, img in spectral_data:
+                imgs.append(img.flatten(1).to(device))
+            img_data = torch.stack(imgs).to(device) # (M, C, num_pixels)
+            img_data = img_data.transpose(0,1) # (C, M, num_pixels)
+            img_data_proj = torch.zeros((self.channels, img_data.shape[1], self.config.num_frequencies * 2), device=device)
+            for i, proj in enumerate(self.spectral_projections):
+                img_data_proj[i] = proj(img_data[i])
+            img_data = img_data_proj.transpose(0,1) # (M, C, 2*F)
+            for k, v in spec_dict.items():
+                spectral_values[v,:,:] = img_data[k,:,:]
+        
+        spectral_values = torch.cat([spectral_values, self.spectral_embeddings.weight.unsqueeze(0).repeat(B, 1, 1)], dim=-1) # (B, L(1), C, 2*F + I)
+
+        fourier_obs = self.fourier(observations) # (B, L, P, 2*F)
+
+        embedding_obs = self.input_embeddings.weight.unsqueeze(0).unsqueeze(0).repeat(B, L, 1, 1) # (B, L, P, I)
+        combined_obs = torch.cat([fourier_obs, embedding_obs], dim=-1) # (B, L, P, IH)
+        mask = mask.squeeze()
+        hidden = torch.cat([combined_obs.squeeze(), spectral_values], dim=-2)
+        hidden = self.hidden_proj(hidden)
+        hidden = self.layer_norm(hidden)
+
+        for layer in self.layers:
+            hidden, _ = layer(hidden, hidden, mask=mask)
+        
+        op = self.output_proj(hidden[:,-1,:]).squeeze()
+        loss = self.loss(fluxes.squeeze(), op)
+        
+        return {
+            'loss': loss,
+            'logits': op,
+        }
+    
+
+    def loss(self, pred, target):
+        loss = (pred - target) ** 2
+        return loss.mean()
