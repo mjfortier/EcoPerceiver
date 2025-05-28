@@ -1,8 +1,13 @@
 import math
 import torch
 from torch import nn
-from typing import Optional
+from typing import Optional, Tuple, List
+from einops import rearrange
+import numpy as np
 from collections import OrderedDict
+from dataset import EcoPerceiverBatch
+from dataclasses import dataclass
+from constants import *
 
 class GELUActivation(nn.Module):
     """
@@ -40,7 +45,6 @@ ACT2CLS = {
     "tanh": nn.Tanh,
 }
 ACT2FN = ClassInstantier(ACT2CLS)
-
 
 
 class MultiheadAttentionBlock(nn.Module):
@@ -178,3 +182,252 @@ class AttentionLayer(nn.Module):
             return (h, att)
         else:
             return (h, None)
+
+
+class FourierFeatureMapping(nn.Module):
+    def __init__(self, num_frequencies):
+        super().__init__()
+        self.num_frequencies = num_frequencies
+
+    def forward(self, values):
+        embeddings = torch.arange(self.num_frequencies).to(values.device)
+        embeddings = torch.pi * 2 ** embeddings
+        embeddings = embeddings * values.unsqueeze(-1)
+        sin_emb = torch.sin(embeddings)
+        cos_emb = torch.cos(embeddings)
+        return torch.cat([sin_emb, cos_emb], dim=-1)
+
+
+#---------------#
+# Input Modules #
+#---------------#
+
+
+@dataclass
+class EcoSageConfig:
+    # General config
+    latent_space_dim: int = 64
+    num_frequencies: int = 12
+    input_embedding_dim: int = 22
+    weight_sharing: bool = False
+    context_length: int = 64
+    num_heads: int = 8
+    mlp_ratio: int = 3
+    obs_dropout: float = 0.0
+    layers: str = 'wcswcswcswcsss' # c = cross-attention (with input), s = self-attention
+    causal: bool = True
+    targets: Tuple = ('NEE')
+
+    # ECInputModule config
+    allowable_ec_predictors: List[str] = EC_PREDICTORS
+
+    # ModisLinearInputModule config
+    modis_channels: int = 9
+    modis_resolution: Tuple = (8,8)
+    mask_ratio: float = 0.3
+
+    # GeoInputModule
+    allowable_geo_predictors: List[str] = GEO_PREDICTORS
+
+    # PhenocamRGBInputModule
+    num_tokens_per_image: int = 4
+    cnn_model: str = 'resnet18' # test before changing this...
+
+
+class ECInputModule(nn.Module):
+    def __init__(self, config: EcoSageConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.fourier = FourierFeatureMapping(self.config.num_frequencies)
+        self.allowable_vars = self.config.allowable_ec_predictors
+        self.embeddings = nn.Embedding(len(self.allowable_vars), self.config.input_embedding_dim)
+
+
+    def _filter_nan_vars(self, input_vars, ec_data):
+        keep_vars = []
+        keep_indices = []
+        for i, v in enumerate(input_vars):
+            if (~ec_data[:,:,i].isnan()).sum() > 0: # there's at least one valid entry
+                keep_vars.append(v)
+                keep_indices.append(i)
+        keep_indices = torch.IntTensor(keep_indices).to(ec_data.device)
+        keep_data = torch.index_select(ec_data, dim=-1, index=keep_indices)
+        return keep_vars, keep_data
+
+
+    def forward(self, batch: EcoPerceiverBatch) -> Tuple:
+        device = self.embeddings.weight.device
+        input_vars = batch.predictor_columns
+        ec_data = batch.predictor_values.to(device)
+        embedding_map = {v: self.embeddings.weight[i] for i, v in enumerate(self.allowable_vars)}
+        assert set(input_vars) <= set(self.allowable_vars), f'ERROR: found unseen variables in EC Input Module: f{[c for c in input_vars if c not in self.allowable_vars]}'
+        
+        keep_vars, ec_data = self._filter_nan_vars(input_vars, ec_data)
+        B, L, _ = ec_data.shape
+        mask = ec_data.isnan().to(device)
+        fourier_encoded = self.fourier(ec_data)
+        embeddings = torch.stack([embedding_map[i] for i in keep_vars]).unsqueeze(0).unsqueeze(0).repeat(B, L, 1, 1)
+        output = torch.cat([fourier_encoded, embeddings], dim=-1)
+        output = rearrange(output, 'B L P IH -> (B L) P IH')
+        mask = rearrange(mask, 'B L P -> (B L) P').unsqueeze(1)
+        output = output.nan_to_num(0.0) # the mask takes care of this
+        return output, mask
+
+
+class ModisLinearInputModule(nn.Module):
+    def __init__(self, config: EcoSageConfig) -> None:
+        super().__init__()
+        self.config = config
+        h, w = self.config.modis_resolution
+        self.num_pixels = h * w
+        self.channels = self.config.modis_channels
+        self.hidden_size = self.config.num_frequencies * 2
+        self.spectral_projection = nn.ModuleList(
+            [nn.Linear(self.num_pixels, self.hidden_size) for _ in range(self.channels)]
+        )
+        self.spectral_embeddings = nn.Embedding(self.channels, self.config.input_embedding_dim)
+        self.mask_ratio = self.config.mask_ratio
+        self.image_placeholder = nn.Parameter(torch.zeros(self.channels, self.num_pixels), requires_grad=False)
+
+    def _generate_mask(self, sample: Tuple) -> torch.Tensor:
+        if len(sample) == 0:
+            return torch.Tensor([True] * self.channels)
+        mask = []
+        img = sample[0]
+        for i in range(self.channels):
+            ratio_nan = torch.where(img[i,:,:] < 0.0, 1.0, 0.0).sum() / self.num_pixels
+            mask.append(ratio_nan > self.mask_ratio)
+        return torch.Tensor(mask)
+
+
+    def forward(self, batch: EcoPerceiverBatch) -> Tuple:
+        modis_data = batch.modis
+        device = self.spectral_embeddings.weight.device
+        B, L, _ = batch.predictor_values.shape
+
+        images = []
+        masks = []
+        for sample in modis_data:
+            masks.append(self._generate_mask(sample))
+            if len(sample) == 0:
+                images.append(self.image_placeholder)
+            else:
+                images.append(rearrange(sample[0], 'C H W -> C (H W)').to(device))
+        
+        mask = torch.stack(masks).to(bool).to(device)
+        if (~mask).sum() == 0: # no valid MODIS imagery
+            return None, None
+        mask = mask.unsqueeze(1).repeat(1, L, 1)
+        
+        images = torch.stack(images)
+        projected = []
+        for i, proj in enumerate(self.spectral_projection):
+            projected.append(proj(images[:,i,:]))
+        projected_images = torch.stack(projected, dim=1) # (B, C, Enc)
+        embeddings = self.spectral_embeddings.weight.unsqueeze(0).repeat(B,1,1)
+        output = torch.cat([projected_images, embeddings], dim=-1) # (B, C, IH)
+        return output, mask
+
+
+class GeoInputModule(nn.Module):
+    def __init__(self, config: EcoSageConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.fourier = FourierFeatureMapping(self.config.num_frequencies)
+        self.allowable_vars = self.config.allowable_geo_predictors
+        self.embeddings = nn.Embedding(len(self.allowable_vars), self.config.input_embedding_dim)
+
+
+    def _filter_nan_vars(self, input_vars, aux_data):
+        keep_vars = []
+        keep_indices = []
+        for i, v in enumerate(input_vars):
+            if (~aux_data[:,i].isnan()).sum() > 0: # there's at least one valid entry
+                keep_vars.append(v)
+                keep_indices.append(i)
+        keep_indices = torch.IntTensor(keep_indices).to(aux_data.device)
+        keep_data = torch.index_select(aux_data, dim=-1, index=keep_indices)
+        return keep_vars, keep_data
+
+
+    def forward(self, batch: EcoPerceiverBatch) -> Tuple:
+        device = self.embeddings.weight.device
+        embedding_map = {v: self.embeddings.weight[i] for i, v in enumerate(self.allowable_vars)}
+        input_vars = batch.aux_columns
+        aux_data = batch.aux_values.to(device)
+        B, L, _ = batch.predictor_values.shape
+        
+        keep_vars, aux_data = self._filter_nan_vars(input_vars, aux_data)
+        mask = aux_data.isnan()
+        fourier_encoded = self.fourier(aux_data)
+
+        embeddings = torch.stack([embedding_map[i] for i in keep_vars]).unsqueeze(0).repeat(B, 1, 1)
+        output = torch.cat([fourier_encoded, embeddings], dim=-1)
+        mask = mask.unsqueeze(1).repeat(1, L, 1)
+        output = output.nan_to_num(0.0) # the mask takes care of this
+        return output, mask
+
+
+class IGBPInputModule(nn.Module):
+    def __init__(self, config: EcoSageConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.allowable_vars = IGBP_CODES
+        self.embedding_length = 2 * self.config.num_frequencies + self.config.input_embedding_dim
+        self.embeddings = nn.Embedding(len(self.allowable_vars), self.embedding_length)
+
+
+    def forward(self, batch: EcoPerceiverBatch) -> Tuple:
+        device = self.embeddings.weight.device
+        embedding_map = {v: self.embeddings.weight[i] for i, v in enumerate(self.allowable_vars)}
+        codes = batch.igbp
+        B, L, _ = batch.predictor_values.shape
+
+        embeddings = torch.zeros((B, 1, self.embedding_length), device=device)
+        mask = torch.zeros((len(codes), L, 1), device=device).to(bool)
+        for i, code in enumerate(codes):
+            if code in self.allowable_vars:
+                embeddings[i,:,:] = embedding_map[code]
+            else:
+                mask[i,:,:] = True
+        
+        return embeddings, mask
+
+
+class PhenocamRGBInputModule(nn.Module):
+    def __init__(self, config: EcoSageConfig) -> None:
+        super().__init__()
+        self.config = config
+        resnet_model = torch.hub.load('pytorch/vision:v0.10.0', self.config.cnn_model, pretrained=True)
+        self.cnn = nn.Sequential(*(list(resnet_model.children())[:-1])) # cut off last layer
+        self.embeddings = nn.Embedding(self.config.num_tokens_per_image, self.config.input_embedding_dim)
+        self.encoding_length = self.config.num_frequencies * 2
+
+        resnet_output_size = 512 # this may need to be changed if the model changes significantly
+        self.fc = nn.Linear(resnet_output_size, self.encoding_length * self.config.num_tokens_per_image)
+    
+
+    def forward(self, batch: EcoPerceiverBatch) -> Tuple:
+        device = self.embeddings.weight.device
+        phenocam_data = batch.phenocam_rgb
+        B, L, _ = batch.predictor_values.shape
+        
+        valid_samples = [i for i, s in enumerate(phenocam_data) if len(s) > 0]
+        if len(valid_samples) == 0:
+            return None, None
+        
+        cnn_input = torch.stack([s[0] for s in phenocam_data if len(s) > 0], dim=0).to(device)
+        hidden = self.cnn(cnn_input).squeeze(2,3)
+        hidden = self.fc(hidden)
+        
+        hidden = rearrange(hidden, 'B (T H) -> B T H', T=self.config.num_tokens_per_image, H=self.encoding_length)
+        embeddings = self.embeddings.weight.unsqueeze(0).repeat(len(valid_samples),1,1)
+        output = torch.cat([hidden, embeddings], dim=-1)
+        
+        full_output = torch.zeros((B, self.config.num_tokens_per_image, self.encoding_length + self.config.input_embedding_dim), device=device)
+        mask = torch.ones((B, L, self.config.num_tokens_per_image), device=device).to(bool)
+        for op_ind, full_ind in enumerate(valid_samples):
+            full_output[full_ind,:,:] = output[op_ind,:,:]
+            mask[full_ind,:,:] = False
+
+        return full_output, mask
