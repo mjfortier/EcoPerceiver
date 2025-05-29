@@ -5,9 +5,41 @@ from typing import Optional, Tuple, List
 from einops import rearrange
 import numpy as np
 from collections import OrderedDict
-from dataset import EcoPerceiverBatch
+from dataset import EcoSageBatch
 from dataclasses import dataclass
 from constants import *
+
+
+@dataclass
+class EcoSageConfig:
+    # General config
+    latent_space_dim: int = 64
+    num_frequencies: int = 12
+    input_embedding_dim: int = 22
+    weight_sharing: bool = False
+    context_length: int = 64
+    num_heads: int = 8
+    mlp_ratio: int = 3
+    obs_dropout: float = 0.0
+    layers: str = 'wcswcswcswcsss' # c = cross-attention (with input), s = self-attention
+    causal: bool = True
+    targets: Tuple = ('NEE',)
+
+    # ECInputModule config
+    allowable_ec_predictors: List[str] = EC_PREDICTORS
+
+    # ModisLinearInputModule config
+    modis_channels: int = 9
+    modis_resolution: Tuple = (8,8)
+    mask_ratio: float = 0.3
+
+    # GeoInputModule
+    allowable_geo_predictors: List[str] = GEO_PREDICTORS
+
+    # PhenocamRGBInputModule
+    num_tokens_per_image: int = 4
+    cnn_model: str = 'resnet18' # test before changing this...
+
 
 class GELUActivation(nn.Module):
     """
@@ -203,37 +235,6 @@ class FourierFeatureMapping(nn.Module):
 #---------------#
 
 
-@dataclass
-class EcoSageConfig:
-    # General config
-    latent_space_dim: int = 64
-    num_frequencies: int = 12
-    input_embedding_dim: int = 22
-    weight_sharing: bool = False
-    context_length: int = 64
-    num_heads: int = 8
-    mlp_ratio: int = 3
-    obs_dropout: float = 0.0
-    layers: str = 'wcswcswcswcsss' # c = cross-attention (with input), s = self-attention
-    causal: bool = True
-    targets: Tuple = ('NEE')
-
-    # ECInputModule config
-    allowable_ec_predictors: List[str] = EC_PREDICTORS
-
-    # ModisLinearInputModule config
-    modis_channels: int = 9
-    modis_resolution: Tuple = (8,8)
-    mask_ratio: float = 0.3
-
-    # GeoInputModule
-    allowable_geo_predictors: List[str] = GEO_PREDICTORS
-
-    # PhenocamRGBInputModule
-    num_tokens_per_image: int = 4
-    cnn_model: str = 'resnet18' # test before changing this...
-
-
 class ECInputModule(nn.Module):
     def __init__(self, config: EcoSageConfig) -> None:
         super().__init__()
@@ -255,7 +256,7 @@ class ECInputModule(nn.Module):
         return keep_vars, keep_data
 
 
-    def forward(self, batch: EcoPerceiverBatch) -> Tuple:
+    def forward(self, batch: EcoSageBatch) -> Tuple:
         device = self.embeddings.weight.device
         input_vars = batch.predictor_columns
         ec_data = batch.predictor_values.to(device)
@@ -300,7 +301,7 @@ class ModisLinearInputModule(nn.Module):
         return torch.Tensor(mask)
 
 
-    def forward(self, batch: EcoPerceiverBatch) -> Tuple:
+    def forward(self, batch: EcoSageBatch) -> Tuple:
         modis_data = batch.modis
         device = self.spectral_embeddings.weight.device
         B, L, _ = batch.predictor_values.shape
@@ -350,7 +351,7 @@ class GeoInputModule(nn.Module):
         return keep_vars, keep_data
 
 
-    def forward(self, batch: EcoPerceiverBatch) -> Tuple:
+    def forward(self, batch: EcoSageBatch) -> Tuple:
         device = self.embeddings.weight.device
         embedding_map = {v: self.embeddings.weight[i] for i, v in enumerate(self.allowable_vars)}
         input_vars = batch.aux_columns
@@ -377,7 +378,7 @@ class IGBPInputModule(nn.Module):
         self.embeddings = nn.Embedding(len(self.allowable_vars), self.embedding_length)
 
 
-    def forward(self, batch: EcoPerceiverBatch) -> Tuple:
+    def forward(self, batch: EcoSageBatch) -> Tuple:
         device = self.embeddings.weight.device
         embedding_map = {v: self.embeddings.weight[i] for i, v in enumerate(self.allowable_vars)}
         codes = batch.igbp
@@ -407,7 +408,7 @@ class PhenocamRGBInputModule(nn.Module):
         self.fc = nn.Linear(resnet_output_size, self.encoding_length * self.config.num_tokens_per_image)
     
 
-    def forward(self, batch: EcoPerceiverBatch) -> Tuple:
+    def forward(self, batch: EcoSageBatch) -> Tuple:
         device = self.embeddings.weight.device
         phenocam_data = batch.phenocam_rgb
         B, L, _ = batch.predictor_values.shape
@@ -431,3 +432,27 @@ class PhenocamRGBInputModule(nn.Module):
             mask[full_ind,:,:] = False
 
         return full_output, mask
+
+
+class FluxOutputModule(nn.Module):
+    def __init__(self, config: EcoSageConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.allowable_vars = self.config.targets
+
+        self.fc = nn.ModuleDict({
+            v: nn.Linear(self.config.latent_space_dim, 1) for v in self.allowable_vars
+        })
+    
+    def forward(self, hidden: torch.Tensor, batch: EcoSageBatch):
+        final_tokens = hidden[:,-1,:].squeeze()
+        
+        op = {}
+        for i, var in enumerate(batch.target_columns):
+            if var not in self.allowable_vars:
+                print(f'WARNING: skipping unseen target {var}')
+                continue
+            pred = self.fc[var](final_tokens).squeeze()
+            target = batch.target_values[:,i].squeeze().to(pred.device)
+            op[var] = torch.stack([target, pred], dim=1)
+        return op
