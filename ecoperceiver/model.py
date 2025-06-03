@@ -28,7 +28,8 @@ class EcoSage(nn.Module):
 
 
     def initialize_weights(self, module):
-        # TODO: This is probably overwriting the resnet weights. Look into how to exclude them from here.
+        if hasattr(module, '_skip_init') and module._skip_init:
+            return
         if isinstance(module, nn.Linear):
             nn.init.xavier_normal_(module.weight)
             if module.bias is not None:
@@ -81,7 +82,8 @@ class EcoSage(nn.Module):
             loss += self.loss(op)
             
         return output_dict, loss
-    
+
+
     def loss(self, output: torch.Tensor) -> torch.Tensor:
         filtered = output[~torch.any(output.isnan(),dim=1)]
         loss = (filtered[:,0] - filtered[:,1]) ** 2

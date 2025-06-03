@@ -10,14 +10,7 @@ from dataclasses import dataclass
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
-
-EC_PREDICTORS = ('DOY', 'TOD', 'TA', 'P', 'RH', 'VPD', 'PA', 'CO2', 'SW_IN', 'SW_IN_POT', 'SW_OUT', 'LW_IN', 'LW_OUT',
-                 'NETRAD', 'PPFD_IN', 'PPFD_OUT', 'WS', 'WD', 'USTAR', 'SWC_1', 'SWC_2', 'SWC_3', 'SWC_4', 'SWC_5',
-                 'TS_1', 'TS_2', 'TS_3', 'TS_4', 'TS_5', 'WTD', 'G', 'H', 'LE',)
-
-EC_TARGETS = ('NEE', 'GPP_DT', 'GPP_NT', 'RECO_DT', 'RECO_NT', 'FCH4')
-
-AUX_DATA = ('lat', 'lon', 'elev', 'igbp')
+from constants import *
 
 
 @dataclass
@@ -37,8 +30,8 @@ class EcoSageLoaderConfig:
     use_modis: bool = True
     use_phenocam: bool = True
     single_image: bool = True
-    context_window_length: int = 32
-    aux_data: Tuple[str] = AUX_DATA
+    context_length: int = 32
+    aux_data: Tuple[str] = GEO_PREDICTORS + ('igbp',)
 
 
 @dataclass
@@ -74,7 +67,7 @@ class EcoSageDataset(Dataset):
         self.config = config
         self.columns = ('id', 'site', 'timestamp') + tuple(self.config.predictors) + tuple(self.config.targets)
 
-        self.window_len = self.config.context_window_length
+        self.window_len = self.config.context_length
         self.sql_file = self.data_path / 'carbonsense_v2.sql'
         self.sites = sites
         if sites == None:
@@ -90,7 +83,7 @@ class EcoSageDataset(Dataset):
             for site in tqdm(self.sites):
                 ids = conn.execute(f'SELECT id FROM ec_data WHERE site == "{site}" AND ({target_boolean}) ORDER BY id;').fetchall()
                 ids = [i[0] for i in ids]
-                ids = ids[self.config.context_window_length-1:]
+                ids = ids[self.config.context_length-1:]
                 indexes.extend(ids)
         self.data = np.array(indexes, dtype=np.int32)
     
@@ -105,7 +98,7 @@ class EcoSageDataset(Dataset):
     
     def __getitem__(self, idx):
         top_index = self.data[idx]
-        bottom_index = top_index - self.config.context_window_length + 1
+        bottom_index = top_index - self.config.context_length + 1
         with sqlite3.connect(self.sql_file) as conn:
             ec_data = conn.execute(f'SELECT {",".join(self.columns)} FROM ec_data WHERE id >= {bottom_index} AND id <= {top_index} ORDER BY id;').fetchall()
             modis_result = conn.execute(f'SELECT row_id, data FROM modis_data WHERE row_id >= {bottom_index} AND row_id <= {top_index};').fetchall()

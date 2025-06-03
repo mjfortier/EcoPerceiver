@@ -16,13 +16,12 @@ class EcoSageConfig:
     latent_space_dim: int = 64
     num_frequencies: int = 12
     input_embedding_dim: int = 22
-    weight_sharing: bool = False
     context_length: int = 64
     num_heads: int = 8
     mlp_ratio: int = 3
     obs_dropout: float = 0.0
-    layers: str = 'wcswcswcswcsss' # c = cross-attention (with input), s = self-attention
-    causal: bool = True
+    layers: str = 'wcswcswcswcsss' # w = windowed cross-attention, c = cross-attention (with input), s = self-attention
+    #causal: bool = True
     targets: Tuple = ('NEE',)
 
     # ECInputModule config
@@ -401,6 +400,7 @@ class PhenocamRGBInputModule(nn.Module):
         self.config = config
         resnet_model = torch.hub.load('pytorch/vision:v0.10.0', self.config.cnn_model, pretrained=True)
         self.cnn = nn.Sequential(*(list(resnet_model.children())[:-1])) # cut off last layer
+        self.cnn._skip_init = True # don't override initial weights
         self.embeddings = nn.Embedding(self.config.num_tokens_per_image, self.config.input_embedding_dim)
         self.encoding_length = self.config.num_frequencies * 2
 
