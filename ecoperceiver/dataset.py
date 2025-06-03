@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
-from constants import *
+from ecoperceiver.constants import *
 
 
 @dataclass
@@ -68,7 +68,7 @@ class EcoSageDataset(Dataset):
         self.columns = ('id', 'site', 'timestamp') + tuple(self.config.predictors) + tuple(self.config.targets)
 
         self.window_len = self.config.context_length
-        self.sql_file = self.data_path / 'carbonsense_v2.sql'
+        self.sql_file = self.data_path / 'carbonsense_v2' / 'carbonsense_v2.sql'
         self.sites = sites
         if sites == None:
             with sqlite3.connect(self.sql_file) as conn:

@@ -210,9 +210,8 @@ def train_one_epoch(model, data_loader, optimizer, epoch, loss_scaler, log_write
             adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, optim_config)
         
         with torch.cuda.amp.autocast(dtype=datatype):
-            op = model(batch)
+            op, loss = model(batch)
         
-        loss = op['loss'] # just the loss on the final step
         assert math.isfinite(loss.item()), f'Loss is {loss}, stopping training.'
 
         loss /= accum_iter

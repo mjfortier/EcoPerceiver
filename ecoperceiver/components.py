@@ -5,9 +5,9 @@ from typing import Optional, Tuple, List
 from einops import rearrange
 import numpy as np
 from collections import OrderedDict
-from dataset import EcoSageBatch
+from ecoperceiver.dataset import EcoSageBatch
 from dataclasses import dataclass
-from constants import *
+from ecoperceiver.constants import *
 
 
 @dataclass

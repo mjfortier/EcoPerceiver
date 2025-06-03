@@ -1,8 +1,8 @@
 import torch
 from torch import nn
 from einops import rearrange
-from constants import *
-from components import EcoSageConfig, ECInputModule, ModisLinearInputModule, AttentionLayer, \
+from ecoperceiver.constants import *
+from ecoperceiver.components import EcoSageConfig, ECInputModule, ModisLinearInputModule, AttentionLayer, \
                        GeoInputModule, IGBPInputModule, PhenocamRGBInputModule, FluxOutputModule
 torch.manual_seed(0)
 
