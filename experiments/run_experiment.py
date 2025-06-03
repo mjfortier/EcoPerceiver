@@ -69,7 +69,7 @@ def main(args):
         os.system(f'rsync -av --progress {tar_file} {slurm_tar_file}')
         os.system(f'tar xf {slurm_tar_file} -C {slurm_path}')
         os.system(f'rm -f {slurm_tar_file}')
-    data_dir = slurm_path
+    data_dir = os.path.join(slurm_path, 'carbonsense_v2')
     dist.barrier()
 
 
@@ -87,7 +87,7 @@ def main(args):
     g = torch.Generator()
     g.manual_seed(SEED)
 
-    dataset_config = EcoSageLoaderConfig(config['dataset'])
+    dataset_config = EcoSageLoaderConfig(**config['dataset'])
     dataset_train = EcoSageDataset(data_dir, dataset_config, config['train_sites'])
     sampler_train = torch.utils.data.DistributedSampler(
         dataset_train, num_replicas=args.world_size, rank=args.rank, shuffle=True

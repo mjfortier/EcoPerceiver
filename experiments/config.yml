@@ -12,6 +12,7 @@ model:
   layers: 'wcswcswcswcsssss'
   targets:
     - NEE
+  pretrained_path: '/home/mfortier/EcoPerceiver/ecoperceiver/resnet18_weights.pth'
 
 
 # Optimizer parameters

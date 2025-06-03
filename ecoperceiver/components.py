@@ -8,6 +8,7 @@ from collections import OrderedDict
 from ecoperceiver.dataset import EcoSageBatch
 from dataclasses import dataclass
 from ecoperceiver.constants import *
+from torchvision.models import resnet18
 
 
 @dataclass
@@ -38,6 +39,7 @@ class EcoSageConfig:
     # PhenocamRGBInputModule
     num_tokens_per_image: int = 4
     cnn_model: str = 'resnet18' # test before changing this...
+    pretrained_path: str = None
 
 
 class GELUActivation(nn.Module):
@@ -394,11 +396,18 @@ class IGBPInputModule(nn.Module):
         return embeddings, mask
 
 
+
 class PhenocamRGBInputModule(nn.Module):
     def __init__(self, config: EcoSageConfig) -> None:
         super().__init__()
         self.config = config
-        resnet_model = torch.hub.load('pytorch/vision:v0.10.0', self.config.cnn_model, pretrained=True)
+        if self.config.pretrained_path:
+            resnet_model = resnet18(weights=None)
+            state_dict = torch.load(self.config.pretrained_path, map_location="cpu")
+            resnet_model.load_state_dict(state_dict)
+        else:
+            from torchvision.models import ResNet18_Weights
+            resnet_model = resnet18(weights=ResNet18_Weights.DEFAULT)
         self.cnn = nn.Sequential(*(list(resnet_model.children())[:-1])) # cut off last layer
         self.cnn._skip_init = True # don't override initial weights
         self.embeddings = nn.Embedding(self.config.num_tokens_per_image, self.config.input_embedding_dim)
