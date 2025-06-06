@@ -1,12 +1,12 @@
 # Run info
 run:
-  tar_name: 'carbonsense_v2.tar'
+  tar_name: 'carbonsense_v2_hourly.tar'
 
 # Model parameters
 model:
-  latent_space_dim: 128
-  num_frequencies: 12
-  input_embedding_dim: 22
+  latent_space_dim: 64
+  num_frequencies: 14
+  input_embedding_dim: 24
   context_length: 32
   obs_dropout: 0.3
   layers: 'wcswcswcswcsssss'
