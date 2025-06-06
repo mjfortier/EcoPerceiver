@@ -20,7 +20,8 @@ class EcoSageConfig:
     context_length: int = 64
     num_heads: int = 8
     mlp_ratio: int = 3
-    obs_dropout: float = 0.0
+    obs_dropout: float = 0.3
+    weight_sharing: bool = False
     layers: str = 'wcswcswcswcsss' # w = windowed cross-attention, c = cross-attention (with input), s = self-attention
     #causal: bool = True
     targets: Tuple = ('NEE',)
