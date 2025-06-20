@@ -14,9 +14,9 @@ import random
 from pathlib import Path
 
 import timm.optim.optim_factory as optim_factory
-from ecoperceiver.dataset import EcoSageLoaderConfig, EcoSageDataset
-from ecoperceiver.components import EcoSageConfig
-from ecoperceiver.model import EcoSage
+from ecoperceiver.dataset import EcoPerceiverLoaderConfig, EcoPerceiverDataset
+from ecoperceiver.components import EcoPerceiverConfig
+from ecoperceiver.model import EcoPerceiver
 
 import misc
 
@@ -87,8 +87,8 @@ def main(args):
     g = torch.Generator()
     g.manual_seed(SEED)
 
-    dataset_config = EcoSageLoaderConfig(**config['dataset'])
-    dataset_train = EcoSageDataset(data_dir, dataset_config, config['train_sites'])
+    dataset_config = EcoPerceiverLoaderConfig(**config['dataset'])
+    dataset_train = EcoPerceiverDataset(data_dir, dataset_config, config['train_sites'])
     sampler_train = torch.utils.data.DistributedSampler(
         dataset_train, num_replicas=args.world_size, rank=args.rank, shuffle=True
     )
@@ -102,7 +102,7 @@ def main(args):
         collate_fn=dataset_train.collate_fn,
         generator=g)
 
-    dataset_val = EcoSageDataset(data_dir, dataset_config, config['val_sites'])
+    dataset_val = EcoPerceiverDataset(data_dir, dataset_config, config['val_sites'])
     sampler_val = torch.utils.data.DistributedSampler(
         dataset_val, num_replicas=args.world_size, rank=args.rank
     )
@@ -126,8 +126,8 @@ def main(args):
     #######
     # Model
     #######
-    model_config = EcoSageConfig(**config['model'])
-    model = EcoSage(model_config)
+    model_config = EcoPerceiverConfig(**config['model'])
+    model = EcoPerceiver(model_config)
     model.to(device)
     
     #model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)

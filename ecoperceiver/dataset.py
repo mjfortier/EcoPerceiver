@@ -14,8 +14,8 @@ from ecoperceiver.constants import *
 
 
 @dataclass
-class EcoSageLoaderConfig:
-    '''Configuration for EcoSage dataloader and preprocessor
+class EcoPerceiverLoaderConfig:
+    '''Configuration for EcoPerceiver dataloader and preprocessor
 
     targets - variable selection for targets. Must be a subset of EC_TARGETS
     targets_max_qc - maximum QC flag (inclusive) to allow for target values. A lower value will result
@@ -35,7 +35,7 @@ class EcoSageLoaderConfig:
 
 
 @dataclass
-class EcoSageBatch:
+class EcoPerceiverBatch:
     sites: Tuple[str] # one value for each sample
     igbp: Tuple[str] # igbp classification
     timestamps: Tuple
@@ -58,10 +58,10 @@ class EcoSageBatch:
         raise NotImplementedError()
 
 
-class EcoSageDataset(Dataset):
+class EcoPerceiverDataset(Dataset):
     def __init__(self,
                  data_dir: Union[str, os.PathLike],
-                 config: EcoSageLoaderConfig,
+                 config: EcoPerceiverLoaderConfig,
                  sites=None):
         self.data_path = Path(data_dir)
         self.config = config
@@ -154,4 +154,4 @@ class EcoSageDataset(Dataset):
         pred_data = torch.stack(pred_data, dim=0)
         targ_data = torch.stack(targ_data, dim=0)
         aux_data = torch.stack(aux_data, dim=0)
-        return EcoSageBatch(sites, igbp, ts, preds, pred_data, targs, targ_data, aux, aux_data, modis, phenocam_ir, phenocam_rgb)
+        return EcoPerceiverBatch(sites, igbp, ts, preds, pred_data, targs, targ_data, aux, aux_data, modis, phenocam_ir, phenocam_rgb)

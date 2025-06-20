@@ -5,14 +5,14 @@ from typing import Optional, Tuple, List
 from einops import rearrange
 import numpy as np
 from collections import OrderedDict
-from ecoperceiver.dataset import EcoSageBatch
+from ecoperceiver.dataset import EcoPerceiverBatch
 from dataclasses import dataclass
 from ecoperceiver.constants import *
 from torchvision.models import resnet18
 
 
 @dataclass
-class EcoSageConfig:
+class EcoPerceiverConfig:
     # General config
     latent_space_dim: int = 64
     num_frequencies: int = 12
@@ -238,7 +238,7 @@ class FourierFeatureMapping(nn.Module):
 
 
 class ECInputModule(nn.Module):
-    def __init__(self, config: EcoSageConfig) -> None:
+    def __init__(self, config: EcoPerceiverConfig) -> None:
         super().__init__()
         self.config = config
         self.fourier = FourierFeatureMapping(self.config.num_frequencies)
@@ -258,7 +258,7 @@ class ECInputModule(nn.Module):
         return keep_vars, keep_data
 
 
-    def forward(self, batch: EcoSageBatch) -> Tuple:
+    def forward(self, batch: EcoPerceiverBatch) -> Tuple:
         device = self.embeddings.weight.device
         input_vars = batch.predictor_columns
         ec_data = batch.predictor_values.to(device)
@@ -278,7 +278,7 @@ class ECInputModule(nn.Module):
 
 
 class ModisLinearInputModule(nn.Module):
-    def __init__(self, config: EcoSageConfig) -> None:
+    def __init__(self, config: EcoPerceiverConfig) -> None:
         super().__init__()
         self.config = config
         h, w = self.config.modis_resolution
@@ -303,7 +303,7 @@ class ModisLinearInputModule(nn.Module):
         return torch.Tensor(mask)
 
 
-    def forward(self, batch: EcoSageBatch) -> Tuple:
+    def forward(self, batch: EcoPerceiverBatch) -> Tuple:
         modis_data = batch.modis
         device = self.spectral_embeddings.weight.device
         B, L, _ = batch.predictor_values.shape
@@ -333,7 +333,7 @@ class ModisLinearInputModule(nn.Module):
 
 
 class GeoInputModule(nn.Module):
-    def __init__(self, config: EcoSageConfig) -> None:
+    def __init__(self, config: EcoPerceiverConfig) -> None:
         super().__init__()
         self.config = config
         self.fourier = FourierFeatureMapping(self.config.num_frequencies)
@@ -353,7 +353,7 @@ class GeoInputModule(nn.Module):
         return keep_vars, keep_data
 
 
-    def forward(self, batch: EcoSageBatch) -> Tuple:
+    def forward(self, batch: EcoPerceiverBatch) -> Tuple:
         device = self.embeddings.weight.device
         embedding_map = {v: self.embeddings.weight[i] for i, v in enumerate(self.allowable_vars)}
         input_vars = batch.aux_columns
@@ -372,7 +372,7 @@ class GeoInputModule(nn.Module):
 
 
 class IGBPInputModule(nn.Module):
-    def __init__(self, config: EcoSageConfig) -> None:
+    def __init__(self, config: EcoPerceiverConfig) -> None:
         super().__init__()
         self.config = config
         self.allowable_vars = IGBP_CODES
@@ -380,7 +380,7 @@ class IGBPInputModule(nn.Module):
         self.embeddings = nn.Embedding(len(self.allowable_vars), self.embedding_length)
 
 
-    def forward(self, batch: EcoSageBatch) -> Tuple:
+    def forward(self, batch: EcoPerceiverBatch) -> Tuple:
         device = self.embeddings.weight.device
         embedding_map = {v: self.embeddings.weight[i] for i, v in enumerate(self.allowable_vars)}
         codes = batch.igbp
@@ -399,7 +399,7 @@ class IGBPInputModule(nn.Module):
 
 
 class PhenocamRGBInputModule(nn.Module):
-    def __init__(self, config: EcoSageConfig) -> None:
+    def __init__(self, config: EcoPerceiverConfig) -> None:
         super().__init__()
         self.config = config
         if self.config.pretrained_path:
@@ -418,7 +418,7 @@ class PhenocamRGBInputModule(nn.Module):
         self.fc = nn.Linear(resnet_output_size, self.encoding_length * self.config.num_tokens_per_image)
     
 
-    def forward(self, batch: EcoSageBatch) -> Tuple:
+    def forward(self, batch: EcoPerceiverBatch) -> Tuple:
         device = self.embeddings.weight.device
         phenocam_data = batch.phenocam_rgb
         B, L, _ = batch.predictor_values.shape
@@ -444,8 +444,8 @@ class PhenocamRGBInputModule(nn.Module):
         return full_output, mask
 
 
-class FluxOutputModule(nn.Module):
-    def __init__(self, config: EcoSageConfig) -> None:
+class FluxLinearOutputModule(nn.Module):
+    def __init__(self, config: EcoPerceiverConfig) -> None:
         super().__init__()
         self.config = config
         self.allowable_vars = self.config.targets
@@ -454,7 +454,7 @@ class FluxOutputModule(nn.Module):
             v: nn.Linear(self.config.latent_space_dim, 1) for v in self.allowable_vars
         })
     
-    def forward(self, hidden: torch.Tensor, batch: EcoSageBatch):
+    def forward(self, hidden: torch.Tensor, batch: EcoPerceiverBatch):
         final_tokens = hidden[:,-1,:].squeeze()
         
         op = {}
@@ -466,3 +466,47 @@ class FluxOutputModule(nn.Module):
             target = batch.target_values[:,i].squeeze().to(pred.device)
             op[var] = torch.stack([target, pred], dim=1)
         return op
+
+
+class FluxGaussianOutputModule(nn.Module):
+    def __init__(self, config: EcoPerceiverConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.allowable_vars = self.config.targets
+
+        # Output 2 values per target: mean and log_std
+        self.fc = nn.ModuleDict({
+            v: nn.Linear(self.config.latent_space_dim, 2) for v in self.allowable_vars
+        })
+
+    def forward(self, hidden: torch.Tensor, batch: EcoPerceiverBatch, compute_loss: bool = False):
+        final_tokens = hidden[:, -1, :].squeeze()
+        op = {}
+        losses = {}
+
+        for i, var in enumerate(batch.target_columns):
+            if var not in self.allowable_vars:
+                print(f'WARNING: skipping unseen target {var}')
+                continue
+            out = self.fc[var](final_tokens)  # shape: (B, 2)
+            mean = out[..., 0]
+            log_std = out[..., 1]
+            std = torch.exp(log_std).clamp(min=1e-6)  # avoid zero std
+
+            target = batch.target_values[:, i].squeeze().to(mean.device)
+            op[var] = {
+                "mean": mean,
+                "std": std,
+                "target": target
+            }
+
+            if compute_loss:
+                # Negative log likelihood for Gaussian
+                nll = 0.5 * torch.log(2 * torch.pi * std ** 2) + 0.5 * ((target - mean) ** 2) / (std ** 2)
+                losses[var] = nll.mean()
+
+        if compute_loss:
+            # Return both predictions and losses
+            return op, losses
+        else:
+            return op
