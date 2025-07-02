@@ -3,7 +3,7 @@ from torch import nn
 from einops import rearrange
 from ecoperceiver.constants import *
 from ecoperceiver.components import EcoPerceiverConfig, ECInputModule, ModisLinearInputModule, AttentionLayer, \
-                       GeoInputModule, IGBPInputModule, PhenocamRGBInputModule, FluxOutputModule
+                       GeoInputModule, IGBPInputModule, PhenocamRGBInputModule, FluxLinearOutputModule
 torch.manual_seed(0)
 
 
@@ -20,7 +20,7 @@ class EcoPerceiver(nn.Module):
 
         layers = self._configure_attention_layers()    
         self.layers = nn.ModuleList(layers)
-        self.output_module = FluxOutputModule(config)
+        self.output_module = FluxLinearOutputModule(config)
         self.apply(self._initialize_weights)
 
 
