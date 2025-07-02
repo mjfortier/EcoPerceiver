@@ -4,11 +4,12 @@ run:
 
 # Model parameters
 model:
-  latent_space_dim: 64
-  num_frequencies: 14
-  input_embedding_dim: 24
+  latent_space_dim: 128
+  num_frequencies: 12
+  input_embedding_dim: 32
   context_length: 32
   obs_dropout: 0.3
+  weight_sharing: true
   layers: 'wcswcswcswcsssss'
   targets:
     - NEE
@@ -18,7 +19,7 @@ model:
 # Optimizer parameters
 optimizer:
   weight_decay: 0.05
-  lr: 5.e-6
+  lr: 5.e-8
   min_lr: 0.0
   warmup_epochs: 1
   num_epochs: 20

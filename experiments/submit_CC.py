@@ -59,7 +59,7 @@ export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
 export MASTER_ADDR=$SLURMD_NODENAME
 
 
-srun python run_experiment.py \\
+srun python /home/mfortier/EcoPerceiver/experiments/run_experiment.py \\
   --run_dir {seed_dir} \\
   --config {config_loc} \\
   --data_dir {data_dir} \\
