@@ -31,8 +31,9 @@ if not os.path.exists('data'):
 with open(args.config, 'r') as file:
     config = yaml.safe_load(file)
 
-run_name = f"{args.prefix}_CC"
-job_name = f"{args.prefix}_{args.seed}_CC"
+run_descriptor = f"{config['optimizer']['lr']}_{'ws' if config['model']['weight_sharing'] else 'nws'}_l{config['model']['latent_space_dim']}_f{config['model']['num_frequencies']}_e{config['model']['input_embedding_dim']}_c{config['model']['context_length']}_o{config['model']['obs_dropout']}_{config['model']['layers']}"
+run_name = f"{args.prefix}_{run_descriptor}_CC"
+job_name = f"{args.prefix}_{args.seed}_{run_descriptor}_CC"
 run_dir = os.path.join(os.path.realpath('runs'), run_name)
 seed_dir = os.path.join(os.path.join(run_dir, f'seed_{args.seed}'))
 
