@@ -463,7 +463,7 @@ class FluxLinearOutputModule(nn.Module):
         })
 
     def mse_loss(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-        # TODO: weight the loss by the number of valid indices?
+        # TODO: weight the loss by the number of valid indices? If we have 512 NEE and like 4 FCH4, the loss will be whack.
 
         if gt.isnan().all():
             return torch.tensor(0.0, device=pred.device)    
@@ -497,15 +497,6 @@ class FluxLinearOutputModule(nn.Module):
             ground_truth=torch.stack(targets, dim=1) if batch.target_values is not None else None, # [batch_size, num_vars]
             loss=sum(losses) if len(losses) > 0 else None
         )
-
-        # for i, var in enumerate(batch.target_columns):
-        #     if var not in self.allowable_vars:
-        #         print(f'WARNING: skipping unseen target {var}')
-        #         continue
-        #     pred = self.fc[var](final_tokens).squeeze() # [batch_size]
-        #     target = batch.target_values[:,i].squeeze().to(pred.device) # [batch_size]
-        #     op[var] = torch.stack([target, pred], dim=1)
-        # return op
 
 
 class FluxGaussianOutputModule(nn.Module):
@@ -545,8 +536,8 @@ class FluxGaussianOutputModule(nn.Module):
                 nll = 0.5 * torch.log(2 * torch.pi * std ** 2) + 0.5 * ((target - mean) ** 2) / (std ** 2)
                 losses[var] = nll.mean()
 
+        # TODO: change this to use the EcoPerceiverOutput dataclass - maybe add an optional variance output to it?
         if compute_loss:
-            # Return both predictions and losses
             return op, losses
         else:
             return op
