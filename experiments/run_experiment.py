@@ -210,7 +210,8 @@ def train_one_epoch(model, data_loader, optimizer, epoch, loss_scaler, log_write
             adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, optim_config)
         
         with torch.cuda.amp.autocast(dtype=datatype):
-            op, loss = model(batch)
+            op = model(batch)
+            loss = op.loss
         
         assert math.isfinite(loss.item()), f'Loss is {loss}, stopping training.'
 
@@ -247,7 +248,8 @@ def validate_one_epoch(model, data_loader, epoch, log_writer):
     
     for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq=1000, header='Val: ')):
         with torch.cuda.amp.autocast(dtype=datatype):
-            op, loss = model(batch)
+            op = model(batch)
+            loss = op.loss
 
         assert math.isfinite(loss.item()), f'Loss is {loss}, stopping training.'
         metric_logger.update(loss=loss)
