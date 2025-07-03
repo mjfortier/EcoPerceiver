@@ -103,6 +103,7 @@ class EcoPerceiver(nn.Module):
             else:
                 hidden, _ = self.layers[i](hidden)
         
+        return self.output_module(hidden, batch)
         output_dict = self.output_module(hidden, batch)
         
         loss = torch.Tensor([0.0]).to(device)
@@ -111,9 +112,3 @@ class EcoPerceiver(nn.Module):
             loss += self.loss(op)
             
         return output_dict, loss
-
-
-    def loss(self, output: torch.Tensor) -> torch.Tensor:
-        filtered = output[~torch.any(output.isnan(),dim=1)]
-        loss = (filtered[:,0] - filtered[:,1]) ** 2
-        return loss.mean().unsqueeze(0)

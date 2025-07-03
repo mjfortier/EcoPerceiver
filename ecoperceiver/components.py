@@ -17,7 +17,7 @@ class EcoPerceiverConfig:
     latent_space_dim: int = 64
     num_frequencies: int = 12
     input_embedding_dim: int = 22
-    context_length: int = 64
+    context_length: int = 32
     num_heads: int = 8
     mlp_ratio: int = 3
     obs_dropout: float = 0.3
@@ -444,6 +444,14 @@ class PhenocamRGBInputModule(nn.Module):
         return full_output, mask
 
 
+@dataclass
+class EcoPerceiverOutput:
+    flux_labels: Tuple
+    predictions: torch.Tensor
+    ground_truth: Optional[torch.Tensor] = None
+    loss: Optional[torch.Tensor] = None
+
+
 class FluxLinearOutputModule(nn.Module):
     def __init__(self, config: EcoPerceiverConfig) -> None:
         super().__init__()
@@ -453,19 +461,51 @@ class FluxLinearOutputModule(nn.Module):
         self.fc = nn.ModuleDict({
             v: nn.Linear(self.config.latent_space_dim, 1) for v in self.allowable_vars
         })
+
+    def mse_loss(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+        # TODO: weight the loss by the number of valid indices?
+
+        if gt.isnan().all():
+            return torch.tensor(0.0, device=pred.device)    
+        valid_indices = ~gt.isnan()
+        pred = pred[valid_indices]
+        gt = gt[valid_indices]
+        loss = (pred - gt) ** 2
+        return loss.mean().unsqueeze(0)
     
     def forward(self, hidden: torch.Tensor, batch: EcoPerceiverBatch):
-        final_tokens = hidden[:,-1,:].squeeze()
+        final_tokens = hidden[:,-1,:].squeeze() # [batch_size, latent_space_dim]
         
-        op = {}
-        for i, var in enumerate(batch.target_columns):
-            if var not in self.allowable_vars:
-                print(f'WARNING: skipping unseen target {var}')
-                continue
-            pred = self.fc[var](final_tokens).squeeze()
-            target = batch.target_values[:,i].squeeze().to(pred.device)
-            op[var] = torch.stack([target, pred], dim=1)
-        return op
+        preds = []
+        targets = []
+        losses = []
+        for var in self.allowable_vars:
+            pred = self.fc[var](final_tokens).squeeze() # [batch_size]
+            preds.append(pred)
+            if batch.target_values is not None:
+                try:
+                    index = batch.target_columns.index(var)
+                    target = batch.target_values[:,-1,index].squeeze().to(pred.device) # [batch_size]
+                    targets.append(target)
+                    losses.append(self.mse_loss(pred, target))
+                except ValueError:
+                    targets.append(torch.tensor([np.nan] * len(pred)).to(pred.device)) # no target for this variable
+
+        return EcoPerceiverOutput(
+            flux_labels=self.allowable_vars,
+            predictions=torch.stack(preds, dim=1), # [batch_size, num_vars]
+            ground_truth=torch.stack(targets, dim=1) if batch.target_values is not None else None, # [batch_size, num_vars]
+            loss=sum(losses) if len(losses) > 0 else None
+        )
+
+        # for i, var in enumerate(batch.target_columns):
+        #     if var not in self.allowable_vars:
+        #         print(f'WARNING: skipping unseen target {var}')
+        #         continue
+        #     pred = self.fc[var](final_tokens).squeeze() # [batch_size]
+        #     target = batch.target_values[:,i].squeeze().to(pred.device) # [batch_size]
+        #     op[var] = torch.stack([target, pred], dim=1)
+        # return op
 
 
 class FluxGaussianOutputModule(nn.Module):

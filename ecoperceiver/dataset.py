@@ -11,6 +11,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 from ecoperceiver.constants import *
+from typing import Optional
 
 
 @dataclass
@@ -41,21 +42,13 @@ class EcoPerceiverBatch:
     timestamps: Tuple
     predictor_columns: Tuple[str] # common mapping for all samples in the batch
     predictor_values: torch.Tensor # all eddy covariance data: (batch, context_window, values)
-    target_columns: Tuple[str]
-    target_values: torch.Tensor
     aux_columns: Tuple[str]
     aux_values: torch.Tensor
     modis: Tuple # all modis data: (batch, ndarray)
     phenocam_ir: Tuple # all phenocam infrared data: (batch, ndarray)
     phenocam_rgb: Tuple # all phenocam rgb data: (batch, ndarray)
-
-    def to(self, device: Any):
-        '''
-        .to(device) is provided with this dataclass as a shortcut to individually moving
-        every piece of data in the class.
-        '''
-        self.ec_values.to(device)
-        raise NotImplementedError()
+    target_columns: Optional[Tuple[str]] = None
+    target_values: Optional[torch.Tensor] = None
 
 
 class EcoPerceiverDataset(Dataset):
@@ -142,16 +135,16 @@ class EcoPerceiverDataset(Dataset):
 
         return site, igbp, ec_timestamps, \
                self.config.predictors, ec_data, \
-               self.config.targets, target_fluxes, \
                ('lat', 'lon', 'elev'), aux_data, \
-               tuple(modis_data), tuple(phenocam_ir), tuple(phenocam_rgb)
+               tuple(modis_data), tuple(phenocam_ir), tuple(phenocam_rgb), \
+               self.config.targets, target_fluxes
     
     def collate_fn(self, batch):
-        sites, igbp, ts, preds, pred_data, targs, targ_data, aux, aux_data, modis, phenocam_ir, phenocam_rgb = zip(*batch)
+        sites, igbp, ts, preds, pred_data, aux, aux_data, modis, phenocam_ir, phenocam_rgb, targs, targ_data = zip(*batch)
         preds = preds[0] # only need to keep 1 copy of the columns
         targs = targs[0]
         aux = aux[0]
         pred_data = torch.stack(pred_data, dim=0)
         targ_data = torch.stack(targ_data, dim=0)
         aux_data = torch.stack(aux_data, dim=0)
-        return EcoPerceiverBatch(sites, igbp, ts, preds, pred_data, targs, targ_data, aux, aux_data, modis, phenocam_ir, phenocam_rgb)
+        return EcoPerceiverBatch(sites, igbp, ts, preds, pred_data, aux, aux_data, modis, phenocam_ir, phenocam_rgb, targs, targ_data)
