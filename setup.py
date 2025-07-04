@@ -15,7 +15,8 @@ setup(
         'pandas==2.0.1',
         'torch==2.0',
         'torchvision=0.16.2',
-        'einops==0.6.1'
+        'einops==0.6.1',
+        'tqdm==4.65.0'
     ],
     python_requires='>=3.9',
 )

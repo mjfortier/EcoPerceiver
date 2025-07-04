@@ -19,7 +19,7 @@ model:
 # Optimizer parameters
 optimizer:
   weight_decay: 0.05
-  lr: 5.e-8
+  lr: 3.e-6
   min_lr: 0.0
   warmup_epochs: 1
   num_epochs: 20
