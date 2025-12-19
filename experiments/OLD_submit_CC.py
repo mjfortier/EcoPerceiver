@@ -16,7 +16,6 @@ parser.add_argument("--dry_run", action='store_true', default=False)
 parser.add_argument("--prefix", default='')
 parser.add_argument("--main", action='store_true', default=False)
 parser.add_argument("--seed", type=int, default=0)
-parser.add_argument("--cpus_per_task", type=int, default=2)
 
 args = parser.parse_args()
 
@@ -41,15 +40,12 @@ config_loc = os.path.join(run_dir, 'config.yml')
 
 data_dir = os.path.realpath('data')
 tensorboard_dir = os.path.join(os.path.realpath('tensorboard'), run_name)
-total_tasks = args.n_nodes * args.gpus_per_node
 
 job_script=f"""#!/bin/bash
 #SBATCH --nodes={args.n_nodes}
-#SBATCH --ntasks={total_tasks}
-#SBATCH --ntasks-per-node={args.gpus_per_node}
 #SBATCH --gres=gpu:h100:{args.gpus_per_node}
-#SBATCH --mem=32G
-#SBATCH --cpus-per-task={args.cpus_per_task}
+#SBATCH --mem=16G
+#SBATCH --cpus-per-gpu=2
 #SBATCH --time=0-{args.hours}:00:00
 #SBATCH --output={seed_dir}/%N-%j.out
 #SBATCH --error={seed_dir}/%N-%j.error
@@ -62,8 +58,6 @@ source /home/l/luislara/links/scratch/env/ecoperceiver/bin/activate
 export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
 export MASTER_ADDR=$SLURMD_NODENAME
 
-echo MASTER_PORT: $MASTER_PORT
-echo MASTER_ADDR: $MASTER_ADDR
 
 srun python /home/l/luislara/links/scratch/EcoPerceiver/experiments/run_experiment.py \\
   --run_dir {seed_dir} \\

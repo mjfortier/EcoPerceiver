@@ -1,0 +1,26 @@
+Configuration loaded:
+  Model targets: ['NEE', 'GPP_DT', 'RECO_DT', 'FCH4', 'LE']
+  Context length: 32
+  Latent space dim: 128
+  Test sites: 49 sites
+  Checkpoint path: runs/multi_gpu4_newdataset_3e-06_ws_l128_f12_e32_c32_o0.3_wcswcswcswcsssss_CC/seed_0/checkpoint-9.pth
+  Checkpoint exists: True
+Model created with 12864501 parameters
+Loading checkpoint from runs/multi_gpu4_newdataset_3e-06_ws_l128_f12_e32_c32_o0.3_wcswcswcswcsssss_CC/seed_0/checkpoint-9.pth
+Model loaded from epoch 9
+Model moved to cuda and set to evaluation mode
+
+Evaluating site IE-Cra...
+Indexing sites...
+  Finished site IE-Cra
+    Batches: 18
+    Samples: 8753
+    Avg loss: 7.23
+    RMSE NEE: 1.74
+    RMSE GPP_DT: 1.94
+    RMSE RECO_DT: 0.88
+    RMSE FCH4: nan
+    RMSE LE: nan
+
+Evaluating site US-BZo...
+Indexing sites...
