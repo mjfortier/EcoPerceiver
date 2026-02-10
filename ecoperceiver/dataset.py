@@ -105,8 +105,7 @@ class EcoPerceiverDataset(Dataset):
             df.replace([np.inf, -np.inf], np.nan, inplace=True)
             for targ in self.config.targets:
                 targ_numeric = pd.to_numeric(df[targ], errors='coerce')
-                if targ != 'FCH4':
-                    df.loc[targ_numeric.abs() > self.target_abs_limit, targ] = np.nan
+                df.loc[targ_numeric.abs() > self.target_abs_limit, targ] = np.nan
             
             assert len(df['site'].unique()) == 1, f'Pulled rows from multiple sites\nTop index: {top_index}, Bottom index: {bottom_index}'
             site = df['site'].unique()[0]
