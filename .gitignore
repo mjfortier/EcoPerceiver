@@ -165,3 +165,7 @@ experiments/runs
 experiments/data
 experiments/tensorboard
 **.pth
+
+OLD_*/
+logs/
+scripts/run.sh

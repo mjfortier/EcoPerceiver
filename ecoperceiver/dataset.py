@@ -104,7 +104,9 @@ class EcoPerceiverDataset(Dataset):
             # Mask non-finite and extreme target values before tensor conversion.
             df.replace([np.inf, -np.inf], np.nan, inplace=True)
             for targ in self.config.targets:
-                df.loc[df[targ].abs() > self.target_abs_limit, targ] = np.nan
+                targ_numeric = pd.to_numeric(df[targ], errors='coerce')
+                if targ != 'FCH4':
+                    df.loc[targ_numeric.abs() > self.target_abs_limit, targ] = np.nan
             
             assert len(df['site'].unique()) == 1, f'Pulled rows from multiple sites\nTop index: {top_index}, Bottom index: {bottom_index}'
             site = df['site'].unique()[0]

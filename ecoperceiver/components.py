@@ -462,16 +462,47 @@ class FluxLinearOutputModule(nn.Module):
             v: nn.Linear(self.config.latent_space_dim, 1) for v in self.allowable_vars
         })
 
-    def mse_loss(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-        # TODO: weight the loss by the number of valid indices? If we have 512 NEE and like 4 FCH4, the loss will be whack.
+    # def mse_loss(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    #     # TODO: weight the loss by the number of valid indices? If we have 512 NEE and like 4 FCH4, the loss will be whack.
 
+    #     if gt.isnan().all():
+    #         return torch.tensor(0.0, device=pred.device)    
+    #     valid_indices = ~gt.isnan()
+    #     pred = pred[valid_indices]
+    #     gt = gt[valid_indices]
+    #     loss = (pred - gt) ** 2
+    #     return loss.mean().unsqueeze(0)
+
+    def mse_loss(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+        """
+        pred, gt can be any shape, gt may contain NaNs.
+        We compute MSE only on non NaN positions.
+        """
+        # Check input sanity
+        if not torch.isfinite(pred).all():
+            print("mse_loss: pred has non finite values. max abs:", pred.abs().max().item())
+        if not torch.isfinite(gt[~gt.isnan()]).all():
+            print("mse_loss: gt has non finite non NaN values. max abs:", gt.abs().max().item())
+
+        # If all gt are NaN, return zero loss
         if gt.isnan().all():
-            return torch.tensor(0.0, device=pred.device)    
+            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype, requires_grad=True)
+
         valid_indices = ~gt.isnan()
-        pred = pred[valid_indices]
-        gt = gt[valid_indices]
-        loss = (pred - gt) ** 2
-        return loss.mean().unsqueeze(0)
+
+        pred_valid = pred[valid_indices]
+        gt_valid = gt[valid_indices]
+
+        loss = (pred_valid - gt_valid) ** 2
+        loss = loss.mean()
+
+        # check the loss
+        if not torch.isfinite(loss):
+            print("mse_loss: loss became non finite.")
+            print("  pred_valid max abs:", pred_valid.abs().max().item())
+            print("  gt_valid max abs:", gt_valid.abs().max().item())
+
+        return loss.unsqueeze(0)
     
     def forward(self, hidden: torch.Tensor, batch: EcoPerceiverBatch):
         final_tokens = hidden[:,-1,:].squeeze() # [batch_size, latent_space_dim]
