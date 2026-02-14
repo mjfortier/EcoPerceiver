@@ -1,7 +1,9 @@
 import torch
 import yaml
-from torch.utils.data import DataLoader
+import csv
+from torch.utils.data import DataLoader, Subset
 from pathlib import Path
+from tqdm import tqdm
 from ecoperceiver.dataset import EcoPerceiverLoaderConfig
 from ecoperceiver.era5_dataset import ERA5Dataset
 from ecoperceiver.components import EcoPerceiverConfig
@@ -44,9 +46,11 @@ else:
 
 dataset_config = EcoPerceiverLoaderConfig(**config['dataset'])
 dataset = ERA5Dataset(data_path, config=dataset_config)
+max_samples = min(1_000_000, len(dataset))
+dataset_subset = Subset(dataset, range(max_samples))
 
 dataloader = DataLoader(
-    dataset, 
+    dataset_subset, 
     batch_size=config["dataloader"]["batch_size"],  
     shuffle=False,  
     num_workers=8, 
@@ -55,23 +59,54 @@ dataloader = DataLoader(
 )
 
 print(f"Dataset created with {len(dataset)} samples")
+print(f"Running inference on first {max_samples} samples")
 
 print("Testing model inference...")
-with torch.no_grad():
-    batch = next(iter(dataloader))
-    if hasattr(batch, "to"):
-        batch = batch.to(device)
+output_csv_path = base_dir / "era5_predictions.csv"
+rows_written = 0
+batches_processed = 0
+with output_csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+    writer = None
+    include_ground_truth = False
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Inference", unit="batch"):
+            batches_processed += 1
+            if hasattr(batch, "to"):
+                batch = batch.to(device)
 
-    res = model(batch)
+            res = model(batch)
+            yhat = res.predictions
 
-    yhat = res.predictions
-    print(f"Pred shape: {yhat.shape}")
-    if yhat.shape[0] > 0:
-        first_pred = yhat[0].detach().cpu()
-        print("First inferenced sample:")
-        for flux, value in zip(res.flux_labels, first_pred.tolist()):
-            print(f"  {flux}: {value:.6f}")
-    if res.loss is not None:
-        print(f"Loss: {float(res.loss.mean().item()):.4f}")
-    else:
-        print("Loss: N/A (no target_values in inference batch)")
+            if writer is None:
+                fieldnames = ["lat", "lon", "igbp", "timestamp"] + [f"pred_{flux}" for flux in res.flux_labels]
+                include_ground_truth = res.ground_truth is not None
+                if include_ground_truth:
+                    fieldnames += [f"gt_{flux}" for flux in res.flux_labels]
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                writer.writeheader()
+                print(f"Pred shape per batch: {yhat.shape}")
+
+            preds_cpu = yhat.detach().cpu()
+            gt_cpu = res.ground_truth.detach().cpu() if include_ground_truth else None
+            lat_idx = batch.aux_columns.index("lat") if "lat" in batch.aux_columns else None
+            lon_idx = batch.aux_columns.index("lon") if "lon" in batch.aux_columns else None
+            aux_cpu = batch.aux_values.detach().cpu()
+
+            for i in range(preds_cpu.shape[0]):
+                ts = batch.timestamps[i][-1] if len(batch.timestamps[i]) > 0 else ""
+                lat_val = float(aux_cpu[i, lat_idx].item() * 180.0) if lat_idx is not None else float("nan")
+                lon_val = float(aux_cpu[i, lon_idx].item() * 180.0) if lon_idx is not None else float("nan")
+                row = {
+                    "igbp": batch.igbp[i],
+                    "timestamp": ts,
+                    "lat": f"{lat_val:.2f}",
+                    "lon": f"{lon_val:.2f}",
+                }
+                for j, flux in enumerate(res.flux_labels):
+                    row[f"pred_{flux}"] = f"{preds_cpu[i, j].item():.4f}"
+                    if include_ground_truth:
+                        row[f"gt_{flux}"] = f"{gt_cpu[i, j].item():.4f}"
+                writer.writerow(row)
+                rows_written += 1
+
+print(f"Saved predictions for {rows_written} samples across {batches_processed} batches to: {output_csv_path}")

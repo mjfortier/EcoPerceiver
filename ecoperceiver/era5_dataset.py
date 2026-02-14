@@ -82,7 +82,8 @@ class ERA5Dataset(Dataset):
         empty_modalities = tuple(() for _ in range(batch_size))
 
         return EcoPerceiverBatch(
-            sites=tuple('' for _ in range(batch_size)),            igbp=igbp,
+            sites=tuple('' for _ in range(batch_size)),            
+            igbp=igbp,
             timestamps=ts,
             predictor_columns=preds,
             predictor_values=predictor_values,
