@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import pandas as pd
+pd.set_option('future.no_silent_downcasting', True)
 import torch
 import sqlite3
 from pathlib import Path
@@ -68,6 +69,7 @@ class EcoPerceiverDataset(Dataset):
                 result = conn.execute("SELECT DISTINCT site FROM ec_data;").fetchall()
                 self.sites = [s[0] for s in result]
         self.transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]) # TODO: add normalize (get mean and std first)
+        self.target_abs_limit = 100  # mask extreme targets to avoid overflow/inf losses
         
         indexes = []
         print('Indexing sites...')
@@ -79,7 +81,7 @@ class EcoPerceiverDataset(Dataset):
                 ids = ids[self.config.context_length-1:]
                 indexes.extend(ids)
         self.data = np.array(indexes, dtype=np.int32)
-    
+
     def __len__(self):
         return len(self.data)
 
@@ -98,6 +100,13 @@ class EcoPerceiverDataset(Dataset):
             phenocam_result = conn.execute(f'SELECT row_id, files FROM phenocam_data WHERE row_id >= {bottom_index} AND row_id <= {top_index};').fetchall()
 
             df = pd.DataFrame(data=ec_data, columns=self.columns)
+
+            # Mask non-finite and extreme target values before tensor conversion.
+            df.replace([np.inf, -np.inf], np.nan, inplace=True)
+            for targ in self.config.targets:
+                targ_numeric = pd.to_numeric(df[targ], errors='coerce')
+                df.loc[targ_numeric.abs() > self.target_abs_limit, targ] = np.nan
+            
             assert len(df['site'].unique()) == 1, f'Pulled rows from multiple sites\nTop index: {top_index}, Bottom index: {bottom_index}'
             site = df['site'].unique()[0]
             aux_result = conn.execute(f'SELECT {",".join(self.config.aux_data)} FROM site_data WHERE site == "{site}";').fetchall()
@@ -107,7 +116,7 @@ class EcoPerceiverDataset(Dataset):
         ec_timestamps = df['timestamp'].tolist()
         ec_data = torch.tensor(df[list(self.config.predictors)].fillna(value=np.nan).astype(np.float32).values)
         target_fluxes = torch.tensor(df[list(self.config.targets)].fillna(value=np.nan).astype(np.float32).values)
-
+        
         modis_data = []
         modis_from_bytes = lambda x: torch.tensor(np.frombuffer(x, dtype=np.float32).reshape(9,8,8))
         if self.config.use_modis:

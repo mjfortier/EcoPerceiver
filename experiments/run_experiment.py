@@ -47,6 +47,14 @@ def main(args):
     
     misc.init_distributed_mode(args)
 
+    print(
+        f"[rank {args.rank}] local_rank={args.local_rank} "
+        f"cuda_visible={os.environ.get('CUDA_VISIBLE_DEVICES')} "
+        f"device_count={torch.cuda.device_count()} "
+        f"current_device={torch.cuda.current_device()}",
+        flush=True,
+    )
+
     print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
     print("{}".format(args).replace(', ', ',\n'))
 
@@ -130,7 +138,7 @@ def main(args):
     model = EcoPerceiver(model_config)
     model.to(device)
     
-    #model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+    # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
     model_without_ddp = model.module
 

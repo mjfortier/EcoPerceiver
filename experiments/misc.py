@@ -216,6 +216,9 @@ def init_distributed_mode(args):
     args.master_port = os.environ["MASTER_PORT"]
     args.distributed = True
     
+    # Set CUDA device before init so NCCL does not guess and hang on first collectives.
+    torch.cuda.set_device(args.gpu)
+
     print(f'| distributed init {args}', flush=True)
 
     torch.distributed.init_process_group(
@@ -226,7 +229,6 @@ def init_distributed_mode(args):
         timeout=timedelta(seconds=600),
     )
     
-    torch.cuda.set_device(args.gpu)
     setup_for_distributed(args.rank == 0)
 
 
@@ -299,7 +301,7 @@ def load_model(args, config, model_without_ddp, optimizer, loss_scaler):
 
         if log_path.exists():
             print("Auto-Resume: Found existing checkpoint")
-            checkpoint = torch.load(log_path, map_location='cpu')
+            checkpoint = torch.load(log_path, map_location='cpu', weights_only=False)
 
             model_without_ddp.load_state_dict(checkpoint['model'])
             optimizer.load_state_dict(checkpoint['optimizer'])
