@@ -19,7 +19,7 @@ setup(
         'torchvision==0.21.0',
         'einops==0.8.0',
         'tqdm==4.67.0',
-        # 'rioxarray==0.19.0',
+        'rioxarray==0.19.0',
         # 'rasterio==1.4.3',
         # 'xarray==2025.7.0',
         'xarray==2025.7.1',
