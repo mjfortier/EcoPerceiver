@@ -163,6 +163,7 @@ cython_debug/
 
 experiments/runs
 # experiments/data
+experiments/data/era5.db
 experiments/data/era5_data
 experiments/tensorboard
 **.pth

@@ -66,7 +66,9 @@ def port_netcdf_to_database():
         df = minmax_normalization(df)
         df['timestamp'] = df['timestamp'].apply(format_datetime)
 
-        coords = df[['lat', 'lon', 'elev', 'igbp']].drop_duplicates().reset_index(drop=True)
+        wanted = ['lat', 'lon', 'elev', 'igbp']
+        existing = [c for c in wanted if c in df.columns]
+        coords = df[existing].drop_duplicates().reset_index(drop=True)
         coords['coord_id'] = coords.index + 1
 
         df = df.merge(coords, on=['lat', 'lon', 'elev', 'igbp'], how='left')
