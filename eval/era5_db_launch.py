@@ -4,6 +4,7 @@
 import os
 import glob
 import sqlite3
+import requests
 import rioxarray as rxr
 import xarray as xr
 import pandas as pd
@@ -11,12 +12,60 @@ import numpy as np
 
 from pathlib import Path
 from scipy.spatial import cKDTree
+from scipy.ndimage import convolve
 
-from ecoperceiver.constants import (
-    EC_PREDICTORS,
-    IGBP_ACRONYMS,
-    DEFAULT_NORM,
-)
+EC_PREDICTORS = ('DOY', 'TOD', 'TA', 'P', 'RH', 'VPD', 'PA', 'CO2', 'SW_IN', 'SW_IN_POT', 'SW_OUT', 'LW_IN', 'LW_OUT',
+                 'NETRAD', 'PPFD_IN', 'PPFD_OUT', 'WS', 'WD', 'USTAR', 'SWC_1', 'SWC_2', 'SWC_3', 'SWC_4', 'SWC_5',
+                 'TS_1', 'TS_2', 'TS_3', 'TS_4', 'TS_5', 'WTD', 'G', 'H')
+
+EC_TARGETS = ('NEE', 'GPP_DT', 'GPP_NT', 'RECO_DT', 'RECO_NT', 'FCH4', 'LE')
+
+GEO_PREDICTORS = ('lat', 'lon', 'elev')
+
+IGBP_CODES = ('ENF', 'MF', 'WET', 'CRO', 'GRA', 'WAT', 'SAV', 'DBF', 'CSH', 'OSH', 'EBF', 'WSA', 'BSV', 'URB',
+              'DNF', 'CVM', 'SNO')
+
+IGBP_ACRONYMS = {
+    0: 'WAT', 1: 'ENF', 2: 'EBF', 3: 'DNF', 4: 'DBF', 5: 'MF', 6: 'CSH',
+    7: 'OSH', 8: 'WSA', 9: 'SAV', 10: 'GRA', 11: 'WET', 12: 'CRO',
+    13: None, 14: 'CVM', 15: 'SNO', 16: None,
+}
+
+DEFAULT_NORM = {
+    'DOY': {'cyclic': True, 'norm_max': 366.0, 'norm_min': 0.0},
+    'TOD': {'cyclic': True, 'norm_max': 24.0, 'norm_min': 0.0},
+    'TA': {'cyclic': False, 'norm_max': 80.0, 'norm_min': -80.0},
+    'P': {'cyclic': False, 'norm_max': 100.0, 'norm_min': 0.0},
+    'RH': {'cyclic': False, 'norm_max': 100.0, 'norm_min': 0.0},
+    'VPD': {'cyclic': False, 'norm_max': 110.0, 'norm_min': 0.0},
+    'PA': {'cyclic': False, 'norm_max': 110.0, 'norm_min': 0.0},
+    'CO2': {'cyclic': False, 'norm_max': 750.0, 'norm_min': 0.0},
+    'SW_IN': {'cyclic': False, 'norm_max': 1500.0, 'norm_min': -1500.0},
+    'SW_IN_POT': {'cyclic': False, 'norm_max': 1500.0, 'norm_min': -1500.0},
+    'SW_OUT': {'cyclic': False, 'norm_max': 500.0, 'norm_min': -500.0},
+    'LW_IN': {'cyclic': False, 'norm_max': 1000.0, 'norm_min': -1000.0},
+    'LW_OUT': {'cyclic': False, 'norm_max': 1000.0, 'norm_min': -1000.0},
+    'NETRAD': {'cyclic': False, 'norm_max': 1000.0, 'norm_min': -1000.0},
+    'PPFD_IN': {'cyclic': False, 'norm_max': 2500.0, 'norm_min': -2500.0},
+    'PPFD_OUT': {'cyclic': False, 'norm_max': 1000.0, 'norm_min': -1000.0},
+    'WS': {'cyclic': False, 'norm_max': 100.0, 'norm_min': -100.0},
+    'WD': {'cyclic': True, 'norm_max': 360.0, 'norm_min': 0.0},
+    'USTAR': {'cyclic': False, 'norm_max': 4.0, 'norm_min': -4.0},
+    'SWC_1': {'cyclic': False, 'norm_max': 0.0, 'norm_min': 100.0},
+    'SWC_2': {'cyclic': False, 'norm_max': 0.0, 'norm_min': 100.0},
+    'SWC_3': {'cyclic': False, 'norm_max': 0.0, 'norm_min': 100.0},
+    'SWC_4': {'cyclic': False, 'norm_max': 0.0, 'norm_min': 100.0},
+    'SWC_5': {'cyclic': False, 'norm_max': 0.0, 'norm_min': 100.0},
+    'TS_1': {'cyclic': False, 'norm_max': 40.0, 'norm_min': -40.0},
+    'TS_2': {'cyclic': False, 'norm_max': 40.0, 'norm_min': -40.0},
+    'TS_3': {'cyclic': False, 'norm_max': 40.0, 'norm_min': -40.0},
+    'TS_4': {'cyclic': False, 'norm_max': 40.0, 'norm_min': -40.0},
+    'TS_5': {'cyclic': False, 'norm_max': 40.0, 'norm_min': -40.0},
+    'WTD': {'cyclic': False, 'norm_max': -3.0, 'norm_min': 3.0},
+    'G': {'cyclic': False, 'norm_max': 700.0, 'norm_min': -700.0},
+    'H': {'cyclic': False, 'norm_max': 700.0, 'norm_min': -700.0},
+    'LE': {'cyclic': False, 'norm_max': 700.0, 'norm_min': -700.0},
+}
 
 # ======================== Paths and Table Names ========================
 
@@ -29,6 +78,8 @@ DB_PATH = DATA_PATH / 'era5.db'
 DATA_TABLE_NAME = 'ec_data'
 COORD_TABLE_NAME = 'coord_data'
 
+LSM_PATH = DATA_PATH / 'lsm.nc'
+LSM_URL = 'https://confluence.ecmwf.int/download/attachments/140385202/lsm_1279l4_0.1x0.1.grb_v4_unpack.nc?version=1&modificationDate=1591983422208&api=v2'
 
 
 # ======================== Data Transfer ========================
@@ -52,6 +103,8 @@ def launch_sqlite():
 
 
 def port_netcdf_to_database():
+    query_land_sea_mask()
+
     for path in glob.glob(os.path.join(ERA5_DATA_PATH, '*.nc')):
         ds = xr.open_dataset(path, engine="netcdf4")
         df = (ds.to_dataframe()
@@ -65,6 +118,7 @@ def port_netcdf_to_database():
               })
             )
         
+        df = land_sea_mask(df)
         df = add_doy_and_tod(df)
         df = add_igbp(df)
         df = minmax_normalization(df)
@@ -89,6 +143,80 @@ def port_netcdf_to_database():
 
 
 # ======================== Helpers ========================
+
+def query_land_sea_mask():
+    try:
+        r = requests.get(LSM_URL, stream=True)
+        r.raise_for_status()
+
+        with open(LSM_PATH, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=1): 
+                if chunk:
+                    f.write(chunk)
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to download {LSM_URL}: {e}")
+
+
+def land_sea_mask(df: pd.DataFrame) -> pd.DataFrame:
+    ds_lsm = xr.open_dataset(LSM_PATH, engine="netcdf4")
+
+    target_lats = np.arange(-90, 90.25, 0.25)
+    target_lons = np.arange(0, 360, 0.25)
+
+    mask_interp = ds_lsm.interp(
+        latitude=target_lats,
+        longitude=target_lons,
+        method="linear"
+    )
+
+    mask_025 = mask_interp.to_dataframe().reset_index()
+    mask_025['longitude'] = ((mask_025['longitude'] + 180) % 360) - 180
+
+    df_merged = df.merge(
+        mask_025[['latitude','longitude','lsm']],
+        left_on=['lat','lon'],
+        right_on=['latitude','longitude'],
+        how='left'
+    )
+
+    df_spatial = df_merged[['lat','lon','lsm']].drop_duplicates()
+
+    # 2D grid.head()
+    grid = df_spatial.pivot(index="lat", columns="lon", values="lsm")
+
+    # binary mask
+    land = (grid > 0.5).astype(int)
+
+    conv_kernel = np.array([
+        [1.0, 1.0, 1.0],
+        [1.0, 0.0, 1.0],
+        [1.0, 1.0, 1.0],
+    ])
+
+    land_neighbours = convolve(
+        land.values,
+        conv_kernel,
+        mode='constant',
+        cval=0.0
+    )
+
+    land_neighbours_df = pd.DataFrame(
+        land_neighbours,
+        index=land.index,
+        columns=land.columns,
+    )
+
+    keep = (land == 1) | (land_neighbours_df > 0)
+    keep_flat = keep.stack().reset_index()
+
+    assert keep_flat.shape[0] == (keep.shape[0] * keep.shape[1])
+
+    keep_flat.columns = ['lat', 'lon', 'keep']
+    df_filtered = df_spatial.merge(keep_flat, on=['lat', 'lon'])
+    df_filtered = df_filtered[df_filtered['keep']]
+
+    return df_merged.merge(df_filtered, on=['lat', 'lon'])
+
 
 def add_doy_and_tod(df: pd.DataFrame) -> pd.DataFrame:
     df_copy = df.copy()
