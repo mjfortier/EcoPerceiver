@@ -68,14 +68,17 @@ def port_netcdf_to_database():
 
         wanted = ['lat', 'lon', 'elev', 'igbp']
         existing = [c for c in wanted if c in df.columns]
+        if 'coord_id' not in df.columns: df['coord_id'] = range(len(df))
+
         coords = df[existing].drop_duplicates().reset_index(drop=True)
         coords['coord_id'] = coords.index + 1
 
         df = df.merge(coords, on=existing, how='left')
 
+        existing_predictors = [p for p in EC_PREDICTORS if p in df.columns]
         with sqlite3.connect(DB_PATH) as conn:
             coords.to_sql(COORD_TABLE_NAME, conn, if_exists='replace', index=False)
-            df[[ 'coord_id', 'timestamp', *EC_PREDICTORS ]].to_sql(DATA_TABLE_NAME, conn, if_exists='append', index=False)
+            df[[ 'coord_id', 'timestamp', *existing_predictors ]].to_sql(DATA_TABLE_NAME, conn, if_exists='append', index=False)
             conn.commit()
 
         print(f'Inserted {len(df)} rows from {os.path.basename(path)}')
