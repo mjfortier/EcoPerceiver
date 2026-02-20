@@ -32,8 +32,6 @@ DATA_TABLE_NAME = 'ec_data'
 COORD_TABLE_NAME = 'coord_data'
 
 LSM_PATH = DATA_PATH / 'lsm.nc'
-LSM_URL = 'https://confluence.ecmwf.int/download/attachments/140385202/lsm_1279l4_0.1x0.1.grb_v4_unpack.nc?version=1&modificationDate=1591983422208&api=v2'
-
 
 # ======================== Data Transfer ========================
 
@@ -56,8 +54,6 @@ def launch_sqlite():
 
 
 def port_netcdf_to_database():
-    query_land_sea_mask()
-
     for path in glob.glob(os.path.join(ERA5_DATA_PATH, '*.nc')):
         ds = xr.open_dataset(path, engine="netcdf4")
         df = (ds.to_dataframe()
@@ -96,19 +92,6 @@ def port_netcdf_to_database():
 
 
 # ======================== Helpers ========================
-
-def query_land_sea_mask():
-    try:
-        r = requests.get(LSM_URL, stream=True)
-        r.raise_for_status()
-
-        with open(LSM_PATH, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=1): 
-                if chunk:
-                    f.write(chunk)
-    except requests.exceptions.RequestException as e:
-        print(f"Failed to download {LSM_URL}: {e}")
-
 
 def land_sea_mask(df: pd.DataFrame) -> pd.DataFrame:
     ds_lsm = xr.open_dataset(LSM_PATH, engine="netcdf4")
