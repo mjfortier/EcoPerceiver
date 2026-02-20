@@ -11,8 +11,12 @@ import numpy as np
 
 from pathlib import Path
 from scipy.spatial import cKDTree
-from ecoperceiver.constants import EC_PREDICTORS, IGBP_ACRONYMS, DEFAULT_NORM
 
+from ecoperceiver.constants import (
+    EC_PREDICTORS,
+    IGBP_ACRONYMS,
+    DEFAULT_NORM,
+)
 
 # ======================== Paths and Table Names ========================
 
@@ -57,7 +61,7 @@ def port_netcdf_to_database():
                 'latitude': 'lat',
                 'longitude': 'lon',
                 'valid_time': 'timestamp',
-                'LOCATION_ELEV': 'elev',
+                'ELEVATION': 'elev',
               })
             )
         
