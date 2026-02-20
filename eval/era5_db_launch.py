@@ -71,7 +71,7 @@ def port_netcdf_to_database():
         coords = df[existing].drop_duplicates().reset_index(drop=True)
         coords['coord_id'] = coords.index + 1
 
-        df = df.merge(coords, on=['lat', 'lon', 'elev', 'igbp'], how='left')
+        df = df.merge(coords, on=existing, how='left')
 
         with sqlite3.connect(DB_PATH) as conn:
             coords.to_sql(COORD_TABLE_NAME, conn, if_exists='replace', index=False)
