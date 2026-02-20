@@ -4,7 +4,6 @@
 import os
 import glob
 import sqlite3
-import requests
 import rioxarray as rxr
 import xarray as xr
 import pandas as pd
