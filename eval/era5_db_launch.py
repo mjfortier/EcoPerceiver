@@ -68,7 +68,6 @@ def port_netcdf_to_database():
 
         wanted = ['lat', 'lon', 'elev', 'igbp']
         existing = [c for c in wanted if c in df.columns]
-        if 'coord_id' not in df.columns: df['coord_id'] = range(len(df))
 
         coords = df[existing].drop_duplicates().reset_index(drop=True)
         coords['coord_id'] = coords.index + 1
