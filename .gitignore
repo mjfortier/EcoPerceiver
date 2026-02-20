@@ -161,7 +161,7 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# experiments/runs
+experiments/runs
 # experiments/data
 experiments/data/era5_data
 experiments/tensorboard

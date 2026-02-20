@@ -109,6 +109,9 @@ def add_igbp(df: pd.DataFrame) -> pd.DataFrame:
 
 def minmax_normalization(df: pd.DataFrame) -> pd.DataFrame:
     for pred in EC_PREDICTORS:
+        if pred not in df.columns:
+            continue
+
         vmax = DEFAULT_NORM[pred]['norm_max']
         vmin = DEFAULT_NORM[pred]['norm_min']
         vmid = (vmax + vmin) / 2
@@ -120,6 +123,7 @@ def minmax_normalization(df: pd.DataFrame) -> pd.DataFrame:
 
         df.loc[~df[pred].between(vmin, vmax), pred] = np.nan
         df[pred] = (df[pred] - vmid) / vrange
+    
     return df
 
 
