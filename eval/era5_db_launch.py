@@ -164,8 +164,8 @@ def add_igbp(df: pd.DataFrame) -> pd.DataFrame:
     df_copy = df.copy()
     da = rxr.open_rasterio(IGBP_PATH).isel(band=0)
     df_igbp = pd.DataFrame({
-        'x': np.repeat(da.x.values, len(da.y)),
-        'y': np.tile(da.y.values, len(da.x)),
+        'x': np.tile(da.x.values, len(da.y)),
+        'y': np.repeat(da.y.values, len(da.x)),
         'val': da.values.flatten()
     })
 
