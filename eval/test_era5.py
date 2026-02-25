@@ -47,11 +47,9 @@ else:
 
 dataset_config = EcoPerceiverLoaderConfig(**config['dataset'])
 dataset = ERA5Dataset(data_path, config=dataset_config)
-max_samples = min(1_000_000, len(dataset))
-dataset_subset = Subset(dataset, range(max_samples))
 
 dataloader = DataLoader(
-    dataset_subset, 
+    dataset, 
     batch_size=config["dataloader"]["batch_size"],  
     shuffle=False,  
     num_workers=8, 
