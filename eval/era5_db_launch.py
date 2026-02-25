@@ -54,7 +54,7 @@ def launch_sqlite():
 
 def port_netcdf_to_database():
     for path in glob.glob(os.path.join(ERA5_DATA_PATH, '*.nc')):
-        ds = xr.open_dataset(path, engine="netcdf4")
+        ds = xr.open_dataset(path, engine="h5netcdf")
         df = (ds.to_dataframe()
               .reset_index()
               .drop(columns=['region_id'])
@@ -93,7 +93,7 @@ def port_netcdf_to_database():
 # ======================== Helpers ========================
 
 def land_sea_mask(df: pd.DataFrame) -> pd.DataFrame:
-    ds_lsm = xr.open_dataset(LSM_PATH, engine="netcdf4")
+    ds_lsm = xr.open_dataset(LSM_PATH, engine="h5netcdf")
 
     target_lats = np.arange(-90, 90.25, 0.25)
     target_lons = np.arange(0, 360, 0.25)
