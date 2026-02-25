@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from typing import Optional
 from einops import rearrange
 from ecoperceiver.constants import *
 from ecoperceiver.components import EcoPerceiverConfig, ECInputModule, ModisLinearInputModule, AttentionLayer, \
@@ -8,9 +9,10 @@ torch.manual_seed(0)
 
 
 class EcoPerceiver(nn.Module):
-    def __init__(self, config: EcoPerceiverConfig, relative_pretrained_path: str):
+    def __init__(self, config: EcoPerceiverConfig, relative_pretrained_path: Optional[str] = None):
         super().__init__()
-        config.pretrained_path = relative_pretrained_path # hotfix to have the weights from relative path
+        if relative_pretrained_path is not None:
+            config.pretrained_path = relative_pretrained_path
         self.config = config
         self.windowed_modules = nn.ModuleList([ECInputModule(config)])
         self.auxiliary_modules = nn.ModuleList([ModisLinearInputModule(config), GeoInputModule(config), IGBPInputModule(config), PhenocamRGBInputModule(config)])
