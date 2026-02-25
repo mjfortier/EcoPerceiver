@@ -162,10 +162,15 @@ cython_debug/
 #.idea/
 
 experiments/runs
-experiments/data
+# experiments/data
+experiments/data/era5.db
+experiments/data/era5_data
+experiments/data/lsm.nc
 experiments/tensorboard
 **.pth
 
 OLD_*/
 logs/
 scripts/run.sh
+
+era5_predictions.csv

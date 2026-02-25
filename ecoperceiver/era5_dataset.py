@@ -20,7 +20,6 @@ class ERA5Dataset(Dataset):
 
         print('Indexing coordinates...')
         with sqlite3.connect(self.sql_file) as conn:
-            # Récupérer tous les IDs en une seule fois
             result = conn.execute("""
                 SELECT id, coord_id 
                 FROM ec_data 

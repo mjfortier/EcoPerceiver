@@ -27,7 +27,8 @@ print(f"Checkpoint exists: {checkpoint_path.exists()}")
 
 model_config = EcoPerceiverConfig(**config["model"])
 
-model = EcoPerceiver(model_config)
+relative_pretrained_path = base_dir.parent / "ecoperceiver" / "resnet18_weights.pth"
+model = EcoPerceiver(model_config, relative_pretrained_path)
 print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
 
 if checkpoint_path.exists():

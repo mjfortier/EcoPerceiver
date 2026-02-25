@@ -8,8 +8,9 @@ torch.manual_seed(0)
 
 
 class EcoPerceiver(nn.Module):
-    def __init__(self, config: EcoPerceiverConfig):
+    def __init__(self, config: EcoPerceiverConfig, relative_pretrained_path: str):
         super().__init__()
+        config.pretrained_path = relative_pretrained_path # hotfix to have the weights from relative path
         self.config = config
         self.windowed_modules = nn.ModuleList([ECInputModule(config)])
         self.auxiliary_modules = nn.ModuleList([ModisLinearInputModule(config), GeoInputModule(config), IGBPInputModule(config), PhenocamRGBInputModule(config)])
