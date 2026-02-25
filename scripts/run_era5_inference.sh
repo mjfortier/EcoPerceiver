@@ -7,19 +7,17 @@
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
-module load StdEnv/2023 openmpi/4.1.5 netcdf-mpi/4.9.2 mpi4py/4.0.3 proj/9.2.0 python/3.12
+module load python/3.12
 
 printf "\nCreating the environment."
-virtualenv --no-download $SLURM_TMPDIR/csdpenv
-source $SLURM_TMPDIR/csdpenv/bin/activate
+virtualenv --no-download $SLURM_TMPDIR/ecoperceiverenv
+source $SLURM_TMPDIR/ecoperceiverenv/bin/activate
 
 pip install --upgrade pip --no-index
 
 printf "\nInstalling EcoPerceiver dependencies."
 pip install -e . --no-cache-dir --ignore-installed --no-index
 pip install scipy --no-index
-
-export LD_PRELOAD=$EBROOTOPENMPI/lib/libmpi.so
 
 printf "\nExecuting the inference script."
 cd eval/
