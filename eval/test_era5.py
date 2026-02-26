@@ -58,7 +58,6 @@ dataloader = DataLoader(
 )
 
 print(f"Dataset created with {len(dataset)} samples")
-print(f"Running inference on first {max_samples} samples")
 
 print("Testing model inference...")
 output_csv_path = base_dir / "era5_predictions.csv"
