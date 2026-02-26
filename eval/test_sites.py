@@ -1,66 +1,69 @@
+from __future__ import annotations
+
 import argparse
 import csv
 from pathlib import Path
-
 import numpy as np
 import torch
 import torch.multiprocessing as mp
 import yaml
 from torch.utils.data import DataLoader
-
-from ecoperceiver.components import EcoPerceiverConfig
-from ecoperceiver.dataset import EcoPerceiverDataset, EcoPerceiverLoaderConfig
-from ecoperceiver.model import EcoPerceiver
+from utils import (
+    resolve_checkpoint_path,
+    resolve_config_path,
+    resolve_data_dir,
+    resolve_device,
+)
 
 mp.set_sharing_strategy("file_system")
 
 
-def get_args() -> argparse.Namespace:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run EcoPerceiver inference on test sites.")
     parser.add_argument(
-        "--run_folder",
+        "--run-path",
         required=True,
         type=Path,
         help="Run folder path (typically .../seed_<n>) where checkpoints are stored.",
     )
     parser.add_argument(
-        "--data_dir",
+        "--data-dir",
         type=Path,
         default=Path("experiments/data/carbonsense_v2"),
         help="Path to extracted dataset directory (must contain carbonsense_v2.sql).",
     )
     parser.add_argument(
-        "--config_path",
+        "--config-path",
         type=Path,
         default=None,
         help="Optional explicit config.yml path. If omitted, resolves from run folder.",
     )
     parser.add_argument(
-        "--checkpoint_path",
+        "--checkpoint-path",
         type=str,
         default=None,
         help="Checkpoint filename inside run folder (e.g. checkpoint-9.pth). If omitted, auto-selects best checkpoint.",
     )
     parser.add_argument(
-        "--output_name",
+        "--output-name",
         type=str,
         default="test_sites_metrics.csv",
         help="Output CSV filename inside <run_folder>/eval.",
     )
     parser.add_argument(
-        "--batch_size",
+        "--batch-size",
         type=int,
         default=None,
         help="Optional eval batch size override. Defaults to config dataloader batch_size.",
     )
     parser.add_argument(
-        "--num_workers",
+        "--num-workers",
         type=int,
         default=1,
         help="Number of dataloader workers for inference.",
     )
     parser.add_argument(
-        "--pin_memory",
+        "--pin-memory",
         action="store_true",
         help="Enable pin_memory in inference dataloader.",
     )
@@ -77,80 +80,6 @@ def get_args() -> argparse.Namespace:
         help="Optional explicit list of sites to evaluate. Defaults to config test_sites.",
     )
     return parser.parse_args()
-
-
-def resolve_config_path(run_folder: Path, explicit_config_path: Path | None) -> Path:
-    if explicit_config_path is not None:
-        if not explicit_config_path.exists():
-            raise FileNotFoundError(f"Config file not found: {explicit_config_path}")
-        return explicit_config_path
-
-    candidates = [
-        run_folder / "config.yml",
-        run_folder.parent / "config.yml",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError(
-        f"Could not resolve config.yml from run folder {run_folder}. "
-        "Looked at run_folder/config.yml and run_folder/../config.yml."
-    )
-
-
-def _checkpoint_sort_key(path: Path) -> tuple[int, int]:
-    name = path.stem
-    if name.startswith("checkpoint-"):
-        suffix = name.split("checkpoint-", maxsplit=1)[-1]
-        if suffix.isdigit():
-            return (1, int(suffix))
-    if name == "last":
-        return (0, -1)
-    return (-1, -1)
-
-
-def resolve_checkpoint_path(run_folder: Path, checkpoint_filename: str | None) -> Path:
-    if checkpoint_filename is not None:
-        checkpoint_name = Path(checkpoint_filename)
-        if checkpoint_name.is_absolute() or checkpoint_name.name != checkpoint_filename:
-            raise ValueError(
-                "checkpoint_path must be a filename only (e.g. checkpoint-9.pth), not a full path."
-            )
-        checkpoint_path = run_folder / checkpoint_name
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Checkpoint not found in run_folder: {checkpoint_path}")
-        return checkpoint_path
-
-    candidates = list(run_folder.glob("checkpoint-*.pth"))
-    if (run_folder / "last.pth").exists():
-        candidates.append(run_folder / "last.pth")
-
-    if not candidates:
-        raise FileNotFoundError(
-            f"No checkpoint found in {run_folder}. Expected checkpoint-*.pth or last.pth."
-        )
-    return max(candidates, key=_checkpoint_sort_key)
-
-
-def resolve_device(device_arg: str) -> torch.device:
-    if device_arg == "cpu":
-        return torch.device("cpu")
-    if device_arg == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("Requested --device cuda but CUDA is not available.")
-        return torch.device("cuda")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def resolve_data_dir(data_dir: Path) -> Path:
-    resolved_data_dir = data_dir.expanduser().resolve()
-    sql_file = resolved_data_dir / "carbonsense_v2.sql"
-    if not sql_file.exists():
-        raise FileNotFoundError(
-            f"Dataset sqlite file not found: {sql_file}. "
-            "Provide --data_dir pointing to extracted carbonsense_v2 directory."
-        )
-    return resolved_data_dir
 
 
 def compute_rmse_and_nse(
@@ -259,13 +188,25 @@ def evaluate_site(
 
 
 def main() -> None:
-    args = get_args()
-    run_folder = args.run_folder.expanduser().resolve()
+    args = parse_args()
+    from ecoperceiver.components import EcoPerceiverConfig
+    from ecoperceiver.dataset import EcoPerceiverDataset, EcoPerceiverLoaderConfig
+    from ecoperceiver.model import EcoPerceiver
+
+    run_folder = args.run_path.expanduser().resolve()
     if not run_folder.exists():
         raise FileNotFoundError(f"Run folder does not exist: {run_folder}")
 
     config_path = resolve_config_path(run_folder, args.config_path)
-    checkpoint_path = resolve_checkpoint_path(run_folder, args.checkpoint_path)
+    explicit_checkpoint_path = None
+    if args.checkpoint_path is not None:
+        checkpoint_name = Path(args.checkpoint_path)
+        if checkpoint_name.is_absolute() or checkpoint_name.name != args.checkpoint_path:
+            raise ValueError(
+                "checkpoint-path must be a filename only (e.g. checkpoint-9.pth), not a full path."
+            )
+        explicit_checkpoint_path = run_folder / checkpoint_name
+    checkpoint_path = resolve_checkpoint_path(run_folder, explicit_checkpoint_path)
     results_dir = run_folder / "eval"
     results_dir.mkdir(parents=True, exist_ok=True)
     output_csv_path = results_dir / args.output_name
@@ -294,7 +235,16 @@ def main() -> None:
     print(f"Model moved to {device} and set to eval mode")
 
     dataset_config = EcoPerceiverLoaderConfig(**config["dataset"])
-    eval_batch_size = args.batch_size or config.get("dataloader", {}).get("batch_size", 512)
+    if args.batch_size is not None and args.batch_size <= 0:
+        raise ValueError("--batch-size must be a positive integer when provided.")
+    eval_batch_size = (
+        args.batch_size if args.batch_size is not None else config.get("dataloader", {}).get("batch_size", 512)
+    )
+    if eval_batch_size <= 0:
+        raise ValueError(
+            "Resolved batch size must be positive. "
+            "Provide --batch-size or fix dataloader.batch_size in config."
+        )
     eval_num_workers = args.num_workers
     eval_pin_memory = args.pin_memory
 
