@@ -172,5 +172,6 @@ experiments/tensorboard
 OLD_*/
 logs/
 scripts/run.sh
+scripts/run_era5.sh
 
 era5_predictions.csv
