@@ -16,7 +16,7 @@ RUN_PATH="experiments/runs/final_v2_3e-06_ws_l128_f12_e32_c32_o0.3_wcswcswcswcss
 PYTHONPATH=. python eval/test_sites.py \
     --run-path "$RUN_PATH" \
     --checkpoint-path checkpoint-11.pth \
-    --batch-size 2048 \
+    --batch-size 1024 \
     --num-workers 8 \
     --data-dir "/home/l/luislara/links/projects/aip-pal/luislara/carbonsense_v2" 
 
