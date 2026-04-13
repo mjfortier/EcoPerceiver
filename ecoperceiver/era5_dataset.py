@@ -3,6 +3,8 @@ import sqlite3
 import torch as tr
 import numpy as np
 import pandas as pd
+from bisect import bisect_right
+from collections import OrderedDict
 from torch.utils.data import Dataset
 from pathlib import Path
 from dataclasses import dataclass
@@ -57,6 +59,11 @@ class ERA5Dataset(Dataset):
         )
         self._conn: Optional[sqlite3.Connection] = None
         self._conn_pid: Optional[int] = None
+        self._worker_pid: Optional[int] = None
+        self._coord_cache = OrderedDict()
+        self._modis_index_cache = OrderedDict()
+        self._coord_cache_size = 4096
+        self._modis_cache_size = 64
         if not self.sql_file.exists():
             raise FileNotFoundError(f'ERA5 sqlite file not found: {self.sql_file}')
 
@@ -90,6 +97,9 @@ class ERA5Dataset(Dataset):
         state = self.__dict__.copy()
         state['_conn'] = None
         state['_conn_pid'] = None
+        state['_worker_pid'] = None
+        state['_coord_cache'] = OrderedDict()
+        state['_modis_index_cache'] = OrderedDict()
         return state
 
     def __del__(self):
@@ -106,13 +116,97 @@ class ERA5Dataset(Dataset):
             self._conn = None
             self._conn_pid = None
 
-    def _get_connection(self) -> sqlite3.Connection:
+    @staticmethod
+    def _remember_cached_item(cache: OrderedDict, key, value, max_size: int):
+        cache[key] = value
+        cache.move_to_end(key)
+        if len(cache) > max_size:
+            cache.popitem(last=False)
+
+    def _ensure_worker_state(self):
         current_pid = os.getpid()
-        if self._conn is None or self._conn_pid != current_pid:
+        if self._worker_pid == current_pid:
+            return
+        self._close_connection()
+        self._coord_cache = OrderedDict()
+        self._modis_index_cache = OrderedDict()
+        self._worker_pid = current_pid
+
+    def _get_connection(self) -> sqlite3.Connection:
+        self._ensure_worker_state()
+        if self._conn is None or self._conn_pid != self._worker_pid:
             self._close_connection()
             self._conn = sqlite3.connect(self.sql_file)
-            self._conn_pid = current_pid
+            self._conn_pid = self._worker_pid
         return self._conn
+
+    def _get_coord_data(self, conn: sqlite3.Connection, coord_id: int):
+        cached = self._coord_cache.get(coord_id)
+        if cached is not None:
+            self._coord_cache.move_to_end(coord_id)
+            return cached
+
+        aux_row = conn.execute(
+            f"""
+            SELECT {",".join(self.config.aux_data)}
+            FROM coord_data
+            WHERE coord_id = ?
+            LIMIT 1;
+            """,
+            (int(coord_id),),
+        ).fetchone()
+        if aux_row is None:
+            raise KeyError(f'No coord_data row found for coord_id {coord_id}')
+
+        aux_data = {
+            self.config.aux_data[i]: aux_row[i]
+            for i in range(len(self.config.aux_data))
+        }
+        self._remember_cached_item(self._coord_cache, coord_id, aux_data, self._coord_cache_size)
+        return aux_data
+
+    def _get_modis_index(self, conn: sqlite3.Connection, coord_id: int):
+        if not self.config.use_modis or not self.has_modis_table:
+            return None
+
+        cached = self._modis_index_cache.get(coord_id)
+        if cached is not None:
+            self._modis_index_cache.move_to_end(coord_id)
+            return cached
+
+        rows = conn.execute(
+            """
+            SELECT modis_date, data
+            FROM modis_data
+            WHERE coord_id = ?
+            ORDER BY modis_date;
+            """,
+            (int(coord_id),),
+        ).fetchall()
+        modis_index = (
+            tuple(int(row[0]) for row in rows),
+            tuple(row[1] for row in rows),
+            {},
+        )
+        self._remember_cached_item(
+            self._modis_index_cache,
+            coord_id,
+            modis_index,
+            self._modis_cache_size,
+        )
+        return modis_index
+
+    def _get_modis_tensor(self, modis_index, target_date: int):
+        modis_dates, modis_blobs, tensor_cache = modis_index
+        position = bisect_right(modis_dates, target_date) - 1
+        if position < 0:
+            return None, None
+
+        tensor = tensor_cache.get(position)
+        if tensor is None:
+            tensor = self._modis_from_bytes(modis_blobs[position])
+            tensor_cache[position] = tensor
+        return modis_dates[position], tensor
 
     @staticmethod
     def _timestamp_to_modis_date(timestamp) -> int:
@@ -126,43 +220,27 @@ class ERA5Dataset(Dataset):
         if not self.config.use_modis or not self.has_modis_table or len(timestamps) == 0:
             return tuple()
 
+        modis_index = self._get_modis_index(conn, coord_id)
+        if modis_index is None or len(modis_index[0]) == 0:
+            return tuple()
+
         if self.config.single_image:
             target_date = self._timestamp_to_modis_date(timestamps[-1])
-            result = conn.execute(
-                """
-                SELECT data
-                FROM modis_data
-                WHERE coord_id = ? AND modis_date <= ?
-                ORDER BY modis_date DESC
-                LIMIT 1;
-                """,
-                (int(coord_id), target_date),
-            ).fetchone()
-            if result is None:
+            _, tensor = self._get_modis_tensor(modis_index, target_date)
+            if tensor is None:
                 return tuple()
-            return (self._modis_from_bytes(result[0]),)
+            return (tensor,)
 
         modis_tensors = []
         last_loaded_date = None
         unique_dates = sorted({self._timestamp_to_modis_date(ts) for ts in timestamps})
         for target_date in unique_dates:
-            result = conn.execute(
-                """
-                SELECT modis_date, data
-                FROM modis_data
-                WHERE coord_id = ? AND modis_date <= ?
-                ORDER BY modis_date DESC
-                LIMIT 1;
-                """,
-                (int(coord_id), target_date),
-            ).fetchone()
-            if result is None:
+            loaded_date, tensor = self._get_modis_tensor(modis_index, target_date)
+            if tensor is None:
                 continue
-
-            loaded_date, bytestring = result
             if loaded_date == last_loaded_date:
                 continue
-            modis_tensors.append(self._modis_from_bytes(bytestring))
+            modis_tensors.append(tensor)
             last_loaded_date = loaded_date
 
         return tuple(modis_tensors)
@@ -197,21 +275,7 @@ class ERA5Dataset(Dataset):
         )
         ec_data = tr.from_numpy(predictor_array)
 
-        aux_row = conn.execute(
-            f"""
-            SELECT {",".join(self.config.aux_data)}
-            FROM coord_data
-            WHERE coord_id = ?
-            LIMIT 1;
-            """,
-            (int(coord_id),),
-        ).fetchone()
-        if aux_row is None:
-            raise KeyError(f'No coord_data row found for coord_id {coord_id}')
-        aux_data = {
-            self.config.aux_data[i]: aux_row[i]
-            for i in range(len(self.config.aux_data))
-        }
+        aux_data = self._get_coord_data(conn, coord_id)
         igbp = aux_data['igbp']
         modis_data = self._load_modis_sample(conn, coord_id, ec_timestamps)
 
