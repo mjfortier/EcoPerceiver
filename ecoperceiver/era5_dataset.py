@@ -55,6 +55,8 @@ class ERA5Dataset(Dataset):
             if sql_file is not None
             else (self.data_path / 'era5.db').resolve()
         )
+        self._conn: Optional[sqlite3.Connection] = None
+        self._conn_pid: Optional[int] = None
         if not self.sql_file.exists():
             raise FileNotFoundError(f'ERA5 sqlite file not found: {self.sql_file}')
 
@@ -83,6 +85,34 @@ class ERA5Dataset(Dataset):
                 indexes.extend(ids)
             
             self.data = np.array(indexes, dtype=np.int32)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_conn'] = None
+        state['_conn_pid'] = None
+        return state
+
+    def __del__(self):
+        self._close_connection()
+
+    def _close_connection(self):
+        if self._conn is None:
+            return
+        try:
+            self._conn.close()
+        except sqlite3.Error:
+            pass
+        finally:
+            self._conn = None
+            self._conn_pid = None
+
+    def _get_connection(self) -> sqlite3.Connection:
+        current_pid = os.getpid()
+        if self._conn is None or self._conn_pid != current_pid:
+            self._close_connection()
+            self._conn = sqlite3.connect(self.sql_file)
+            self._conn_pid = current_pid
+        return self._conn
 
     @staticmethod
     def _timestamp_to_modis_date(timestamp) -> int:
@@ -143,25 +173,47 @@ class ERA5Dataset(Dataset):
     def __getitem__(self, idx):
         top_index = self.data[idx]
         bottom_index = top_index - self.config.context_length + 1
+        conn = self._get_connection()
+        ec_rows = conn.execute(
+            f"""
+            SELECT {",".join(self.columns)}
+            FROM ec_data
+            WHERE id >= ? AND id <= ?
+            ORDER BY id;
+            """,
+            (int(bottom_index), int(top_index)),
+        ).fetchall()
+        if len(ec_rows) == 0:
+            raise IndexError(f'No ERA5 rows found for index {idx} (id range {bottom_index}-{top_index})')
 
-        with sqlite3.connect(self.sql_file) as conn:
-            ec_data = conn.execute(f"""
-                SELECT {",".join(self.columns)} 
-                FROM ec_data 
-                WHERE id >= {bottom_index} AND id <= {top_index} 
-                ORDER BY id;
-            """).fetchall()
-        
-            df = pd.DataFrame(data=ec_data, columns=self.columns)
+        coord_id = ec_rows[0][1]
+        ec_timestamps = [row[2] for row in ec_rows]
+        predictor_array = np.asarray(
+            [
+                [np.nan if value is None else value for value in row[3:]]
+                for row in ec_rows
+            ],
+            dtype=np.float32,
+        )
+        ec_data = tr.from_numpy(predictor_array)
 
-            coord_id = df['coord_id'].unique()[0]
-            aux_result = conn.execute(f'SELECT {",".join(self.config.aux_data)} FROM coord_data WHERE coord_id == "{coord_id}";').fetchall()
-            aux_data = {self.config.aux_data[i]: aux_result[0][i] for i in range(len(self.config.aux_data))}
-            igbp = aux_data['igbp']
-            modis_data = self._load_modis_sample(conn, coord_id, df['timestamp'].tolist())
-
-        ec_timestamps = df['timestamp'].tolist()
-        ec_data = tr.tensor(df[list(self.config.predictors)].fillna(value=np.nan).astype(np.float32).values)
+        aux_row = conn.execute(
+            f"""
+            SELECT {",".join(self.config.aux_data)}
+            FROM coord_data
+            WHERE coord_id = ?
+            LIMIT 1;
+            """,
+            (int(coord_id),),
+        ).fetchone()
+        if aux_row is None:
+            raise KeyError(f'No coord_data row found for coord_id {coord_id}')
+        aux_data = {
+            self.config.aux_data[i]: aux_row[i]
+            for i in range(len(self.config.aux_data))
+        }
+        igbp = aux_data['igbp']
+        modis_data = self._load_modis_sample(conn, coord_id, ec_timestamps)
 
         aux_data = tr.tensor([
             aux_data['lat'] / 180.0 if aux_data['lat'] is not None else np.nan,
