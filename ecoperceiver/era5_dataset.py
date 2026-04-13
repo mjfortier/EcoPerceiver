@@ -2,14 +2,12 @@ import os
 import sqlite3
 import torch as tr
 import numpy as np
-import pandas as pd
 from bisect import bisect_right
 from collections import OrderedDict
 from torch.utils.data import Dataset
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
-from tqdm import tqdm
 from ecoperceiver.dataset import EcoPerceiverLoaderConfig
 
 
@@ -42,6 +40,8 @@ class ERA5Batch:
 
 
 class ERA5Dataset(Dataset):
+    _INDEX_FETCH_SIZE = 100_000
+
     def __init__(
         self,
         data_dir: Union[str, os.PathLike],
@@ -78,20 +78,34 @@ class ERA5Dataset(Dataset):
             self.has_modis_table = 'modis_data' in tables
             self.has_phenocam_table = 'phenocam_data' in tables
 
-            result = conn.execute("""
-                SELECT id, coord_id 
-                FROM ec_data 
-                ORDER BY coord_id, id;
-            """).fetchall()
-            
-            df = pd.DataFrame(result, columns=['id', 'coord_id'])
-            
-            indexes = []
-            for _, group in df.groupby('coord_id'):
-                ids = group['id'].values[self.config.context_length-1:]
-                indexes.extend(ids)
-            
-            self.data = np.array(indexes, dtype=np.int32)
+            self.data = self._build_sample_index(conn)
+
+    def _build_sample_index(self, conn: sqlite3.Connection) -> np.ndarray:
+        cursor = conn.execute(
+            """
+            SELECT id, coord_id
+            FROM ec_data
+            ORDER BY coord_id, id;
+            """
+        )
+        indexes = []
+        current_coord_id = None
+        coord_count = 0
+
+        while True:
+            rows = cursor.fetchmany(self._INDEX_FETCH_SIZE)
+            if not rows:
+                break
+            for row_id, coord_id in rows:
+                if coord_id != current_coord_id:
+                    current_coord_id = coord_id
+                    coord_count = 1
+                else:
+                    coord_count += 1
+                if coord_count >= self.config.context_length:
+                    indexes.append(row_id)
+
+        return np.asarray(indexes, dtype=np.int32)
 
     def __getstate__(self):
         state = self.__dict__.copy()

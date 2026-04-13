@@ -45,7 +45,7 @@ def parse_args():
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=1,
+        default=8,
         help="Number of dataloader workers for inference.",
     )
     parser.add_argument(
@@ -53,6 +53,12 @@ def parse_args():
         type=Path,
         required=True,
         help="SQLite database to evaluate against.",
+    )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=1,
+        help="Number of batches prefetched by each dataloader worker.",
     )
     return parser.parse_args()
 
@@ -127,20 +133,29 @@ def main():
         raise ValueError("--batch-size must be a positive integer when provided.")
     if args.num_workers < 0:
         raise ValueError("--num-workers must be >= 0.")
+    if args.prefetch_factor <= 0:
+        raise ValueError("--prefetch-factor must be >= 1.")
     dataloader_batch_size = args.batch_size if args.batch_size is not None else config["dataloader"]["batch_size"]
-    dataloader = DataLoader(
-        dataset_for_loader,
+    dataloader_kwargs = dict(
+        dataset=dataset_for_loader,
         batch_size=dataloader_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=config["dataloader"]["pin_memory"],
         collate_fn=dataset.collate_fn,
     )
+    if args.num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = True
+        dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
+    dataloader = DataLoader(**dataloader_kwargs)
 
     print(f"Dataset created with {len(dataset)} samples")
     print(f"Using {max_samples} samples for inference")
     print(f"Batch size: {dataloader_batch_size}")
     print(f"Num workers: {args.num_workers}")
+    if args.num_workers > 0:
+        print("Persistent workers: True")
+        print(f"Prefetch factor: {args.prefetch_factor}")
     print(f"Output CSV: {output_csv_path}")
 
     print("Testing model inference...")
@@ -163,8 +178,8 @@ def main():
                     include_ground_truth = res.ground_truth is not None
                     if include_ground_truth:
                         fieldnames += [f"gt_{flux}" for flux in res.flux_labels]
-                    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-                    writer.writeheader()
+                    writer = csv.writer(csv_file)
+                    writer.writerow(fieldnames)
                     print(f"Pred shape per batch: {yhat.shape}")
 
                 preds_cpu = yhat.detach().cpu()
@@ -173,22 +188,24 @@ def main():
                 lon_idx = batch.aux_columns.index("lon") if "lon" in batch.aux_columns else None
                 aux_cpu = batch.aux_values.detach().cpu()
 
+                rows = []
                 for i in range(preds_cpu.shape[0]):
                     ts = batch.timestamps[i][-1] if len(batch.timestamps[i]) > 0 else ""
                     lat_val = float(aux_cpu[i, lat_idx].item() * 180.0) if lat_idx is not None else float("nan")
                     lon_val = float(aux_cpu[i, lon_idx].item() * 180.0) if lon_idx is not None else float("nan")
-                    row = {
-                        "igbp": batch.igbp[i],
-                        "timestamp": ts,
-                        "lat": f"{lat_val:.2f}",
-                        "lon": f"{lon_val:.2f}",
-                    }
+                    row = [
+                        f"{lat_val:.2f}",
+                        f"{lon_val:.2f}",
+                        batch.igbp[i],
+                        ts,
+                    ]
                     for j, flux in enumerate(res.flux_labels):
-                        row[f"pred_{flux}"] = f"{preds_cpu[i, j].item():.4f}"
+                        row.append(f"{preds_cpu[i, j].item():.4f}")
                         if include_ground_truth:
-                            row[f"gt_{flux}"] = f"{gt_cpu[i, j].item():.4f}"
-                    writer.writerow(row)
-                    rows_written += 1
+                            row.append(f"{gt_cpu[i, j].item():.4f}")
+                    rows.append(row)
+                writer.writerows(rows)
+                rows_written += len(rows)
 
     print(f"Saved predictions for {rows_written} samples across {batches_processed} batches to: {output_csv_path}")
 
