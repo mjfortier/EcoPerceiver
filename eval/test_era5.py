@@ -22,7 +22,7 @@ def parse_args():
         "--checkpoint-path",
         type=Path,
         default=None,
-        help="Path to checkpoint file (default: run_path/last.pth, else latest checkpoint-*.pth).",
+        help="Path to checkpoint file. Relative paths resolve from <run_path> (default: run_path/last.pth, else latest checkpoint-*.pth).",
     )
     parser.add_argument(
         "--output-csv",
@@ -48,6 +48,12 @@ def parse_args():
         default=1,
         help="Number of dataloader workers for inference.",
     )
+    parser.add_argument(
+        "--db-path",
+        type=Path,
+        required=True,
+        help="SQLite database to evaluate against.",
+    )
     return parser.parse_args()
 
 
@@ -60,13 +66,19 @@ def main():
     from ecoperceiver.dataset import EcoPerceiverLoaderConfig
     from ecoperceiver.era5_dataset import ERA5Dataset
     from ecoperceiver.components import EcoPerceiverConfig
-    from ecoperceiver.model import EcoPerceiver
+    from ecoperceiver.era5_model import ERA5EcoPerceiver
 
     repo_root = Path(__file__).resolve().parent.parent
     run_path = args.run_path.resolve()
     config_path = resolve_config_path(run_path, args.config_path)
-    checkpoint_path = resolve_checkpoint_path(run_path, args.checkpoint_path)
+    explicit_checkpoint_path = args.checkpoint_path.expanduser() if args.checkpoint_path is not None else None
+    if explicit_checkpoint_path is not None and not explicit_checkpoint_path.is_absolute():
+        explicit_checkpoint_path = run_path / explicit_checkpoint_path
+    checkpoint_path = resolve_checkpoint_path(run_path, explicit_checkpoint_path)
     data_path = (repo_root / "experiments/data").resolve()
+    db_path = args.db_path.expanduser().resolve()
+    if not db_path.exists():
+        raise FileNotFoundError(f"SQLite database not found: {db_path}")
     output_csv_path = (
         (run_path / "eval" / "era5_predictions.csv")
         if args.output_csv is None
@@ -85,10 +97,11 @@ def main():
     print(f"Config path: {config_path}")
     print(f"Checkpoint path: {checkpoint_path}")
     print(f"Data path: {data_path}")
+    print(f"DB path: {db_path}")
 
     model_config = EcoPerceiverConfig(**config["model"])
     relative_pretrained_path = repo_root / "ecoperceiver" / "resnet18_weights.pth"
-    model = EcoPerceiver(model_config, relative_pretrained_path)
+    model = ERA5EcoPerceiver(model_config, relative_pretrained_path)
     print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
 
     print(f"Loading checkpoint from {checkpoint_path}")
@@ -101,7 +114,7 @@ def main():
     print(f"Model moved to {device} and set to evaluation mode")
 
     dataset_config = EcoPerceiverLoaderConfig(**config["dataset"])
-    dataset = ERA5Dataset(data_path, config=dataset_config)
+    dataset = ERA5Dataset(data_path, config=dataset_config, sql_file=db_path)
     if args.max_samples is None:
         max_samples = len(dataset)
     else:
