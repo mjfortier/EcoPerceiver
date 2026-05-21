@@ -46,8 +46,8 @@ except ModuleNotFoundError:
     tqdm = None
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_INPUT_DIR = REPO_ROOT / "experiments" / "data" / "test_raw_modis"
-DEFAULT_DB_PATH = REPO_ROOT / "experiments" / "data" / "test_era5.db"
+DEFAULT_INPUT_DIR = REPO_ROOT / "experiments" / "data" / "poc_modis"
+DEFAULT_DB_PATH = REPO_ROOT / "experiments" / "data" / "poc_era5.db"
 CELL_SIZE_DEGREES = 0.25
 CELL_SIZE_PIXELS = 8
 EXPECTED_GRID_WIDTH = 1440
