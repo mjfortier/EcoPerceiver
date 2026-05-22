@@ -4,16 +4,22 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, TypeVar
 
 try:
     import yaml
 except ModuleNotFoundError:
     yaml = None
+
+try:
+    from tqdm.auto import tqdm
+except ModuleNotFoundError:
+    tqdm = None
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -22,7 +28,9 @@ DEFAULT_DB_PATH = Path("/home/l/luislara/links/projects/aip-pal/luislara/ep/data
 DEFAULT_AREAS_CONFIG_PATH = SCRIPT_DIR / "drop_areas_config.yml"
 DEFAULT_TABLE = "ec_data"
 DEFAULT_COORD_TABLE = "coord_data"
+DEFAULT_DELETE_CHUNK_SIZE = 2_000_000
 ERA5_GRID_DEGREES = 0.25
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -40,6 +48,46 @@ class Area:
     enabled: bool
     bounds: AreaBounds
     polygon: tuple[tuple[float, float], ...] | None = None
+
+
+class NullProgress:
+    def update(self, _: int = 1) -> None:
+        pass
+
+    def set_postfix(self, *args, **kwargs) -> None:
+        pass
+
+
+def step_progress(desc: str, total: int):
+    if tqdm is None:
+        return nullcontext(NullProgress())
+    return tqdm(total=total, desc=desc, unit="step", dynamic_ncols=True)
+
+
+def progress_bar(desc: str, total: int, *, unit: str):
+    if tqdm is None:
+        return nullcontext(NullProgress())
+    return tqdm(total=total, desc=desc, unit=unit, dynamic_ncols=True)
+
+
+def progress_iter(
+    iterable: Iterable[T],
+    *,
+    desc: str,
+    total: int | None = None,
+    unit: str,
+    leave: bool = False,
+) -> Iterable[T]:
+    if tqdm is None:
+        return iterable
+    return tqdm(
+        iterable,
+        desc=desc,
+        total=total,
+        unit=unit,
+        leave=leave,
+        dynamic_ncols=True,
+    )
 
 
 def quote_identifier(identifier: str) -> str:
@@ -92,14 +140,6 @@ def parse_args() -> argparse.Namespace:
         help=f"Coordinate table. Default: {DEFAULT_COORD_TABLE}",
     )
     parser.add_argument(
-        "--no-rebuild-ids",
-        action="store_true",
-        help=(
-            "Do not rebuild ec_data ids after deletion. Rebuilding is the "
-            "default because ERA5Dataset expects contiguous id windows."
-        ),
-    )
-    parser.add_argument(
         "--vacuum",
         action="store_true",
         help="Run VACUUM after deleting rows to reclaim disk space.",
@@ -109,6 +149,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print how many rows would be dropped without changing the DB.",
     )
+    parser.add_argument(
+        "--delete-chunk-size",
+        "--delete-coord-chunk-size",
+        dest="delete_chunk_size",
+        type=int,
+        default=DEFAULT_DELETE_CHUNK_SIZE,
+        help=(
+            "Number of ec_data id values to scan per area-delete chunk. "
+            f"Default: {DEFAULT_DELETE_CHUNK_SIZE}."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -117,6 +168,8 @@ def ensure_valid_args(args: argparse.Namespace) -> None:
         raise SystemExit(f"Database does not exist: {args.db_path}")
     if not args.areas_config.exists():
         raise SystemExit(f"Areas config does not exist: {args.areas_config}")
+    if args.delete_chunk_size < 1:
+        raise SystemExit("--delete-chunk-size must be at least 1.")
 
 
 def is_grid_aligned(value: float) -> bool:
@@ -273,28 +326,6 @@ def select_areas(areas: list[Area], selected_names: list[str]) -> list[Area]:
     return [area for area in areas if area.enabled]
 
 
-def table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
-    rows = conn.execute(f"PRAGMA table_info({quote_identifier(table)})").fetchall()
-    return [row[1] for row in rows]
-
-
-def require_tables(conn: sqlite3.Connection, table: str, coord_table: str) -> None:
-    table_cols = table_columns(conn, table)
-    if not table_cols:
-        raise RuntimeError(f"Table does not exist or has no columns: {table}")
-    if "id" not in table_cols:
-        raise RuntimeError(f"Table {table!r} must contain an id column.")
-    if "coord_id" not in table_cols:
-        raise RuntimeError(f"Table {table!r} must contain a coord_id column.")
-
-    coord_cols = table_columns(conn, coord_table)
-    if not coord_cols:
-        raise RuntimeError(f"Table does not exist or has no columns: {coord_table}")
-    for column in ("coord_id", "lat", "lon"):
-        if column not in coord_cols:
-            raise RuntimeError(f"Table {coord_table!r} must contain {column!r}.")
-
-
 def ensure_coord_id_index(conn: sqlite3.Connection, table: str) -> None:
     index_name = "idx_" + re.sub(r"[^A-Za-z0-9_]+", "_", table).strip("_") + "_coord_id"
     conn.execute(
@@ -378,7 +409,12 @@ def area_candidate_rows(
 ) -> list[tuple[int, float, float]]:
     coord_table_sql = quote_identifier(coord_table)
     rows_by_coord_id: dict[int, tuple[int, float, float]] = {}
-    for area in areas:
+    for area in progress_iter(
+        areas,
+        desc="drop_areas read coord_data",
+        total=len(areas),
+        unit="area",
+    ):
         bounds = area.bounds
         rows = conn.execute(
             f"""
@@ -402,7 +438,13 @@ def matching_coord_ids(
     areas: list[Area],
 ) -> list[int]:
     coord_ids = []
-    for coord_id, lat, lon in area_candidate_rows(conn, coord_table, areas):
+    candidate_rows = area_candidate_rows(conn, coord_table, areas)
+    for coord_id, lat, lon in progress_iter(
+        candidate_rows,
+        desc="drop_areas test coords",
+        total=len(candidate_rows),
+        unit="coord",
+    ):
         if any(point_in_area(area, lon=lon, lat=lat) for area in areas):
             coord_ids.append(coord_id)
     return sorted(set(coord_ids))
@@ -412,7 +454,7 @@ def create_matching_coord_table(
     conn: sqlite3.Connection,
     coord_table: str,
     areas: list[Area],
-) -> tuple[str, int]:
+) -> tuple[str, list[int]]:
     temp_table = "drop_areas_matching_coord_ids"
     temp_table_sql = quote_identifier(temp_table)
     coord_ids = matching_coord_ids(conn, coord_table, areas)
@@ -423,7 +465,7 @@ def create_matching_coord_table(
             f"INSERT INTO {temp_table_sql} (coord_id) VALUES (?)",
             [(coord_id,) for coord_id in coord_ids],
         )
-    return temp_table, len(coord_ids)
+    return temp_table, coord_ids
 
 
 def count_matching_rows(
@@ -450,89 +492,71 @@ def count_rows(conn: sqlite3.Connection, table: str) -> int:
     )
 
 
-def create_reindexed_table_sql(conn: sqlite3.Connection, table: str, tmp_table: str) -> str:
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+def id_scan_bounds(conn: sqlite3.Connection, table: str) -> tuple[int, int] | None:
+    table_sql = quote_identifier(table)
+    row = conn.execute(f"SELECT id FROM {table_sql} LIMIT 1").fetchone()
+    if row is None:
+        return None
+
+    seq_row = conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = ?",
         (table,),
     ).fetchone()
-    if row is None or row[0] is None:
-        raise RuntimeError(f"Could not read CREATE TABLE SQL for {table!r}.")
+    if seq_row is not None and seq_row[0] is not None:
+        return 1, int(seq_row[0])
 
-    create_sql = row[0].strip()
-    match = re.match(
-        r"^(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)(?:\"[^\"]+\"|`[^`]+`|\[[^\]]+\]|\w+)",
-        create_sql,
-        flags=re.IGNORECASE,
-    )
-    if match is None:
-        raise RuntimeError(f"Could not rewrite CREATE TABLE SQL for {table!r}.")
-
-    return f"{match.group(1)}{quote_identifier(tmp_table)}{create_sql[match.end():]}"
+    max_row = conn.execute(
+        f"SELECT id FROM {table_sql} ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if max_row is None:
+        return None
+    return 1, int(max_row[0])
 
 
-def rebuild_ids(conn: sqlite3.Connection, table: str) -> None:
-    columns = table_columns(conn, table)
-    if "id" not in columns:
-        raise RuntimeError(f"Cannot rebuild ids because {table!r} has no id column.")
-
-    tmp_table = f"{table}__reindexed"
-    table_sql = quote_identifier(table)
-    tmp_table_sql = quote_identifier(tmp_table)
-    copy_columns = [column for column in columns if column != "id"]
-    copy_columns_sql = ", ".join(quote_identifier(column) for column in copy_columns)
-
-    order_columns = [
-        column for column in ("coord_id", "timestamp", "id") if column in columns
-    ]
-    order_sql = ", ".join(quote_identifier(column) for column in order_columns)
-    if not order_sql:
-        order_sql = quote_identifier("id")
-
-    index_sqls = [
-        row[0]
-        for row in conn.execute(
-            """
-            SELECT sql
-            FROM sqlite_master
-            WHERE type = 'index'
-              AND tbl_name = ?
-              AND sql IS NOT NULL
-            ORDER BY name
-            """,
-            (table,),
-        ).fetchall()
-    ]
-
-    conn.execute(f"DROP TABLE IF EXISTS {tmp_table_sql}")
-    conn.execute(create_reindexed_table_sql(conn, table, tmp_table))
-    conn.execute(
-        f"""
-        INSERT INTO {tmp_table_sql} ({copy_columns_sql})
-        SELECT {copy_columns_sql}
-        FROM {table_sql}
-        ORDER BY {order_sql}
-        """
-    )
-    conn.execute(f"DROP TABLE {table_sql}")
-    conn.execute(f"ALTER TABLE {tmp_table_sql} RENAME TO {table_sql}")
-    for index_sql in index_sqls:
-        conn.execute(index_sql)
+def id_windows(min_id: int, max_id: int, chunk_size: int):
+    start_id = min_id
+    while start_id <= max_id:
+        end_id = min(start_id + chunk_size - 1, max_id)
+        yield start_id, end_id
+        start_id = end_id + 1
 
 
-def delete_matching_rows(
+def delete_matching_ec_rows_by_id_scan(
     conn: sqlite3.Connection,
     table: str,
     temp_coord_table: str,
+    coords_to_drop: int,
+    chunk_size: int,
 ) -> int:
+    if coords_to_drop == 0:
+        return 0
+
+    bounds = id_scan_bounds(conn, table)
+    if bounds is None:
+        return 0
+
+    min_id, max_id = bounds
+    total_id_slots = max_id - min_id + 1
     table_sql = quote_identifier(table)
     temp_coord_table_sql = quote_identifier(temp_coord_table)
-    cursor = conn.execute(
-        f"""
-        DELETE FROM {table_sql}
-        WHERE coord_id IN (SELECT coord_id FROM {temp_coord_table_sql})
-        """
-    )
-    return cursor.rowcount
+    rows_dropped = 0
+    with progress_bar("drop_areas ec_data scan/delete", total_id_slots, unit="row-id") as progress:
+        for start_id, end_id in id_windows(min_id, max_id, chunk_size):
+            progress.set_postfix(id=f"{start_id}-{end_id}", dropped=rows_dropped)
+            progress.refresh()
+            cursor = conn.execute(
+                f"""
+                DELETE FROM {table_sql}
+                WHERE id >= ?
+                  AND id <= ?
+                  AND coord_id IN (SELECT coord_id FROM {temp_coord_table_sql})
+                """,
+                (start_id, end_id),
+            )
+            rows_dropped += cursor.rowcount
+            progress.update(end_id - start_id + 1)
+            progress.set_postfix(id=f"{start_id}-{end_id}", dropped=rows_dropped)
+    return rows_dropped
 
 
 def describe_area(area: Area) -> str:
@@ -549,69 +573,96 @@ def main() -> int:
     args.areas_config = resolve_path(args.areas_config)
     ensure_valid_args(args)
 
-    areas = select_areas(load_areas(args.areas_config), args.area)
-    if not areas:
-        raise SystemExit("No enabled or selected areas to drop.")
+    total_steps = 4 if args.dry_run else 4 + int(args.vacuum)
+    with step_progress("drop_areas", total_steps) as progress:
+        areas = select_areas(load_areas(args.areas_config), args.area)
+        progress.update()
+        if not areas:
+            raise SystemExit("No enabled or selected areas to drop.")
 
-    with sqlite3.connect(args.db_path) as conn:
-        require_tables(conn, args.table, args.coord_table)
-        temp_coord_table, coords_to_drop = create_matching_coord_table(
-            conn, args.coord_table, areas
-        )
+        with sqlite3.connect(args.db_path) as conn:
+            temp_coord_table, coord_ids_to_drop = create_matching_coord_table(
+                conn, args.coord_table, areas
+            )
+            coords_to_drop = len(coord_ids_to_drop)
+            progress.set_postfix(coords=coords_to_drop)
+            progress.update()
 
-        print(f"DB: {args.db_path}")
-        print(f"Table: {args.table}")
-        print(f"Coord table: {args.coord_table}")
-        print(f"Areas config: {args.areas_config}")
-        print("Selected areas:")
-        for area in areas:
-            print(f"  - {describe_area(area)}")
-        print(f"Matching coord rows: {coords_to_drop}")
+            print(f"DB: {args.db_path}", flush=True)
+            print(f"Table to delete from: {args.table}", flush=True)
+            print(f"Coord table used for lookup only: {args.coord_table}", flush=True)
+            print(f"Areas config: {args.areas_config}", flush=True)
+            print("Selected areas:", flush=True)
+            for area in areas:
+                print(f"  - {describe_area(area)}", flush=True)
+            print(f"Matching coord_data rows: {coords_to_drop}", flush=True)
+            bounds = id_scan_bounds(conn, args.table)
+            if bounds is None:
+                print("ec_data id scan range: empty table", flush=True)
+            else:
+                min_id, max_id = bounds
+                print(
+                    f"ec_data id scan range: {min_id}-{max_id} "
+                    f"({max_id - min_id + 1} id values)",
+                    flush=True,
+                )
+                print(
+                    f"Will scan/delete ec_data in chunks of "
+                    f"{args.delete_chunk_size} id values.",
+                    flush=True,
+                )
 
-        if args.dry_run:
-            if has_coord_id_index(conn, args.table):
-                total_rows = count_rows(conn, args.table)
-                rows_to_drop = count_matching_rows(
+            if args.dry_run:
+                if has_coord_id_index(conn, args.table):
+                    total_rows = count_rows(conn, args.table)
+                    progress.update()
+                    rows_to_drop = count_matching_rows(
+                        conn,
+                        args.table,
+                        temp_coord_table,
+                    )
+                    progress.update()
+                    rows_to_keep = total_rows - rows_to_drop
+                    print(f"Rows before: {total_rows}", flush=True)
+                    print(f"Rows to drop from ec_data: {rows_to_drop}", flush=True)
+                    print(f"Rows to keep: {rows_to_keep}", flush=True)
+                else:
+                    progress.update(2)
+                    print(
+                        "Rows to drop: skipped because ec_data.coord_id is not indexed. "
+                        "A real run will create the index before deleting rows.",
+                        flush=True,
+                    )
+                print("Dry run only; no rows were deleted.", flush=True)
+                return 0
+
+            ensure_coord_id_index(conn, args.table)
+            progress.update()
+            conn.execute("BEGIN")
+            try:
+                rows_dropped = delete_matching_ec_rows_by_id_scan(
                     conn,
                     args.table,
                     temp_coord_table,
+                    coords_to_drop,
+                    args.delete_chunk_size,
                 )
-                rows_to_keep = total_rows - rows_to_drop
-                print(f"Rows before: {total_rows}")
-                print(f"Rows to drop: {rows_to_drop}")
-                print(f"Rows to keep: {rows_to_keep}")
-            else:
-                print(
-                    "Rows to drop: skipped because ec_data.coord_id is not indexed. "
-                    "A real run will create the index before deleting rows."
-                )
-            print("Dry run only; no rows were deleted.")
-            return 0
+                progress.set_postfix(coords=coords_to_drop, dropped=rows_dropped)
+                progress.update()
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
-        ensure_coord_id_index(conn, args.table)
-        conn.execute("BEGIN")
-        try:
-            rows_dropped = delete_matching_rows(
-                conn,
-                args.table,
-                temp_coord_table,
-            )
-            if rows_dropped > 0 and not args.no_rebuild_ids:
-                rebuild_ids(conn, args.table)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+        if args.vacuum:
+            with sqlite3.connect(args.db_path) as conn:
+                conn.execute("VACUUM")
+            progress.update()
 
+    print(f"Dropped {rows_dropped} rows from {args.table}.", flush=True)
+    print("Skipped id rebuild; run rebuild_ids_era5 after all filters.", flush=True)
     if args.vacuum:
-        with sqlite3.connect(args.db_path) as conn:
-            conn.execute("VACUUM")
-
-    print(f"Dropped {rows_dropped} rows from {args.table}.")
-    if rows_dropped > 0 and not args.no_rebuild_ids:
-        print("Rebuilt ec_data ids ordered by coord_id, timestamp, id.")
-    if args.vacuum:
-        print("Vacuumed database.")
+        print("Vacuumed database.", flush=True)
 
     return 0
 

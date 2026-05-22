@@ -21,7 +21,7 @@ except ModuleNotFoundError:
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "pipeline_config.yml"
-DEFAULT_STEPS = ("drop_nighttime", "drop_areas", "transform_modis")
+DEFAULT_STEPS = ("drop_nighttime", "drop_areas", "rebuild_ids_era5", "transform_modis")
 
 
 @dataclass(frozen=True)
@@ -42,6 +42,10 @@ STEPS = {
     "drop_areas": PipelineStep(
         name="drop_areas",
         description="Drop ec_data rows inside configured geographic areas.",
+    ),
+    "rebuild_ids_era5": PipelineStep(
+        name="rebuild_ids_era5",
+        description="Rebuild ec_data ids once after all row filters.",
     ),
     "transform_modis": PipelineStep(
         name="transform_modis",
@@ -147,6 +151,7 @@ def parse_args() -> argparse.Namespace:
     transform_config = config_section(config, "transform_modis")
     drop_config = config_section(config, "drop_nighttime")
     drop_areas_config = config_section(config, "drop_areas")
+    rebuild_ids_config = config_section(config, "rebuild_ids_era5")
 
     default_steps = config_list(
         pipeline_config.get("steps"),
@@ -224,6 +229,7 @@ def parse_args() -> argparse.Namespace:
     add_transform_args(parser, transform_config)
     add_drop_nighttime_args(parser, drop_config)
     add_drop_areas_args(parser, drop_areas_config)
+    add_rebuild_ids_args(parser, rebuild_ids_config)
     args = parser.parse_args()
 
     if args.modis_dates is None:
@@ -368,16 +374,6 @@ def add_drop_nighttime_args(
         help="Also drop rows with NULL radiation.",
     )
     group.add_argument(
-        "--rebuild-ids",
-        action=argparse.BooleanOptionalAction,
-        default=bool_config(
-            config.get("rebuild_ids"),
-            default=True,
-            field_name="drop_nighttime.rebuild_ids",
-        ),
-        help="Rebuild ec_data ids after dropping rows.",
-    )
-    group.add_argument(
         "--vacuum",
         action=argparse.BooleanOptionalAction,
         default=bool_config(
@@ -396,6 +392,12 @@ def add_drop_nighttime_args(
             field_name="drop_nighttime.dry_run",
         ),
         help="Run the nighttime filter in dry-run mode even when the pipeline runs.",
+    )
+    group.add_argument(
+        "--nighttime-delete-chunk-size",
+        type=int,
+        default=config.get("delete_chunk_size", 250_000),
+        help="Number of id values scanned per drop_nighttime delete chunk.",
     )
 
 
@@ -423,16 +425,6 @@ def add_drop_areas_args(
         ),
     )
     group.add_argument(
-        "--areas-rebuild-ids",
-        action=argparse.BooleanOptionalAction,
-        default=bool_config(
-            config.get("rebuild_ids"),
-            default=True,
-            field_name="drop_areas.rebuild_ids",
-        ),
-        help="Rebuild ec_data ids after dropping configured areas.",
-    )
-    group.add_argument(
         "--areas-vacuum",
         action=argparse.BooleanOptionalAction,
         default=bool_config(
@@ -451,6 +443,53 @@ def add_drop_areas_args(
             field_name="drop_areas.dry_run",
         ),
         help="Run the area filter in dry-run mode even when the pipeline runs.",
+    )
+    group.add_argument(
+        "--areas-delete-chunk-size",
+        type=int,
+        default=config.get(
+            "delete_chunk_size",
+            config.get("delete_coord_chunk_size", 2_000_000),
+        ),
+        help="Number of ec_data id values scanned per drop_areas delete chunk.",
+    )
+
+
+def add_rebuild_ids_args(
+    parser: argparse.ArgumentParser,
+    config: dict[str, Any],
+) -> None:
+    group = parser.add_argument_group("rebuild_ids_era5 options")
+    group.add_argument(
+        "--rebuild-ids-table",
+        default=config.get("table", "ec_data"),
+        help="ERA5 table whose id column should be rebuilt.",
+    )
+    group.add_argument(
+        "--rebuild-ids-vacuum",
+        action=argparse.BooleanOptionalAction,
+        default=bool_config(
+            config.get("vacuum"),
+            default=False,
+            field_name="rebuild_ids_era5.vacuum",
+        ),
+        help="Run VACUUM after the final ERA5 id rebuild step.",
+    )
+    group.add_argument(
+        "--rebuild-ids-dry-run",
+        action=argparse.BooleanOptionalAction,
+        default=bool_config(
+            config.get("dry_run"),
+            default=False,
+            field_name="rebuild_ids_era5.dry_run",
+        ),
+        help="Run the final ERA5 id rebuild step in dry-run mode.",
+    )
+    group.add_argument(
+        "--rebuild-ids-copy-chunk-size",
+        type=int,
+        default=config.get("copy_chunk_size", 100_000),
+        help="Number of rows copied per rebuild_ids_era5 chunk.",
     )
 
 
@@ -479,6 +518,8 @@ def command_for_step(step: str, args: argparse.Namespace) -> list[str]:
         return drop_nighttime_command(args)
     if step == "drop_areas":
         return drop_areas_command(args)
+    if step == "rebuild_ids_era5":
+        return rebuild_ids_era5_command(args)
     raise ValueError(f"Unsupported pipeline step: {step}")
 
 
@@ -538,11 +579,11 @@ def drop_nighttime_command(args: argparse.Namespace) -> list[str]:
         args.radiation_column,
         "--threshold-w-m2",
         str(args.threshold_w_m2),
+        "--delete-chunk-size",
+        str(args.nighttime_delete_chunk_size),
     ]
     if args.drop_missing_radiation:
         command.append("--drop-missing-radiation")
-    if not args.rebuild_ids:
-        command.append("--no-rebuild-ids")
     if args.vacuum:
         command.append("--vacuum")
     if args.filter_dry_run:
@@ -558,14 +599,32 @@ def drop_areas_command(args: argparse.Namespace) -> list[str]:
         str(args.db_path),
         "--areas-config",
         str(args.areas_config),
+        "--delete-chunk-size",
+        str(args.areas_delete_chunk_size),
     ]
     for area_name in args.drop_areas:
         command.extend(["--area", area_name])
-    if not args.areas_rebuild_ids:
-        command.append("--no-rebuild-ids")
     if args.areas_vacuum:
         command.append("--vacuum")
     if args.areas_dry_run:
+        command.append("--dry-run")
+    return command
+
+
+def rebuild_ids_era5_command(args: argparse.Namespace) -> list[str]:
+    command = [
+        args.python,
+        str(REPO_ROOT / "scripts" / "modis" / "rebuild_ids_era5.py"),
+        "--db-path",
+        str(args.db_path),
+        "--table",
+        args.rebuild_ids_table,
+        "--copy-chunk-size",
+        str(args.rebuild_ids_copy_chunk_size),
+    ]
+    if args.rebuild_ids_vacuum:
+        command.append("--vacuum")
+    if args.rebuild_ids_dry_run:
         command.append("--dry-run")
     return command
 
@@ -576,6 +635,7 @@ def run_command(command: list[str], dry_run: bool) -> None:
         return
 
     env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
     existing_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
         str(REPO_ROOT)

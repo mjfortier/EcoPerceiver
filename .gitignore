@@ -171,6 +171,8 @@ experiments/tensorboard
 
 OLD_*/
 logs/
+!scripts/modis/logs/
+!scripts/modis/logs/.gitkeep
 scripts/run.sh
 scripts/run_era5.sh
 

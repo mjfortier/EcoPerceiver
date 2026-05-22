@@ -525,7 +525,16 @@ def main() -> int:
         f"and writing into {args.output_dir}"
     )
 
-    for product_name in args.products:
+    product_iter = args.products
+    if tqdm is not None:
+        product_iter = tqdm(
+            args.products,
+            desc="download_modis products",
+            unit="product",
+            dynamic_ncols=True,
+        )
+
+    for product_name in product_iter:
         spec = PRODUCTS[product_name]
         asset_ids = fetch_asset_ids(spec, args.start_date, args.end_date)
         asset_dates = sorted(asset_ids)

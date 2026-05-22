@@ -10,11 +10,10 @@ DEFAULT_NORM values, which is how the local ERA5 SQLite databases are built.
 from __future__ import annotations
 
 import argparse
-import re
+from contextlib import nullcontext
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Iterable
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -22,10 +21,30 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from ecoperceiver.constants import DEFAULT_NORM
 
+try:
+    from tqdm.auto import tqdm
+except ModuleNotFoundError:
+    tqdm = None
+
 DEFAULT_DB_PATH = Path("/home/l/luislara/links/projects/aip-pal/luislara/ep/data/era5.db")
 DEFAULT_TABLE = "ec_data"
 DEFAULT_RADIATION_COLUMN = "SW_IN"
 DEFAULT_THRESHOLD_W_M2 = 2.0
+DEFAULT_DELETE_CHUNK_SIZE = 250_000
+
+
+class NullProgress:
+    def update(self, _: int = 1) -> None:
+        pass
+
+    def set_postfix(self, *args, **kwargs) -> None:
+        pass
+
+
+def scan_progress(desc: str, total: int, *, unit: str = "row-id"):
+    if tqdm is None:
+        return nullcontext(NullProgress())
+    return tqdm(total=total, desc=desc, unit=unit, dynamic_ncols=True)
 
 
 def quote_identifier(identifier: str) -> str:
@@ -68,14 +87,6 @@ def parse_args() -> argparse.Namespace:
         help="Also drop rows where the radiation column is NULL.",
     )
     parser.add_argument(
-        "--no-rebuild-ids",
-        action="store_true",
-        help=(
-            "Do not rebuild ec_data ids after deletion. Rebuilding is the "
-            "default because ERA5Dataset expects contiguous id windows."
-        ),
-    )
-    parser.add_argument(
         "--vacuum",
         action="store_true",
         help="Run VACUUM after deleting rows to reclaim disk space.",
@@ -85,57 +96,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print how many rows would be dropped without changing the DB.",
     )
+    parser.add_argument(
+        "--delete-chunk-size",
+        type=int,
+        default=DEFAULT_DELETE_CHUNK_SIZE,
+        help=(
+            "Number of id values to scan per delete chunk. "
+            f"Default: {DEFAULT_DELETE_CHUNK_SIZE}."
+        ),
+    )
     return parser.parse_args()
 
 
 def ensure_valid_args(args: argparse.Namespace) -> None:
     if args.threshold_w_m2 < 0:
         raise SystemExit("--threshold-w-m2 must be non-negative.")
+    if args.delete_chunk_size < 1:
+        raise SystemExit("--delete-chunk-size must be at least 1.")
     if not args.db_path.exists():
         raise SystemExit(f"Database does not exist: {args.db_path}")
-
-
-def table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
-    rows = conn.execute(f"PRAGMA table_info({quote_identifier(table)})").fetchall()
-    return [row[1] for row in rows]
-
-
-def require_table_and_column(
-    conn: sqlite3.Connection,
-    table: str,
-    radiation_column: str,
-) -> None:
-    columns = table_columns(conn, table)
-    if not columns:
-        raise RuntimeError(f"Table does not exist or has no columns: {table}")
-    if radiation_column not in columns:
-        raise RuntimeError(
-            f"Column {radiation_column!r} does not exist in table {table!r}. "
-            f"Available columns: {', '.join(columns)}"
-        )
-
-
-def sample_radiation_values(
-    conn: sqlite3.Connection,
-    table: str,
-    radiation_column: str,
-    sample_size: int = 100_000,
-) -> tuple[float | None, float | None]:
-    table_sql = quote_identifier(table)
-    column_sql = quote_identifier(radiation_column)
-    min_value, max_value = conn.execute(
-        f"""
-        SELECT MIN({column_sql}), MAX({column_sql})
-        FROM (
-            SELECT {column_sql}
-            FROM {table_sql}
-            WHERE {column_sql} IS NOT NULL
-            LIMIT ?
-        )
-        """,
-        (sample_size,),
-    ).fetchone()
-    return min_value, max_value
 
 
 def normalized_threshold(column: str, threshold_w_m2: float) -> float:
@@ -155,52 +134,6 @@ def normalized_threshold(column: str, threshold_w_m2: float) -> float:
     return (threshold_w_m2 - value_mid) / value_range
 
 
-def normalized_bounds(column: str) -> tuple[float, float]:
-    norm = DEFAULT_NORM[column]
-    value_min = norm["norm_min"]
-    value_max = norm["norm_max"]
-    value_mid = (value_max + value_min) / 2.0
-    value_range = value_max - value_min
-    if norm["cyclic"]:
-        value_range /= 2.0
-    return (
-        (value_min - value_mid) / value_range,
-        (value_max - value_mid) / value_range,
-    )
-
-
-def validate_normalized_radiation_values(
-    conn: sqlite3.Connection,
-    table: str,
-    radiation_column: str,
-) -> None:
-    min_value, max_value = sample_radiation_values(conn, table, radiation_column)
-    if min_value is None or max_value is None:
-        return
-
-    expected_min, expected_max = normalized_bounds(radiation_column)
-    tolerance = 1e-6
-    if min_value < expected_min - tolerance or max_value > expected_max + tolerance:
-        raise RuntimeError(
-            f"{radiation_column!r} does not look normalized in {table!r}: "
-            f"sample range is [{min_value:g}, {max_value:g}], expected roughly "
-            f"[{expected_min:g}, {expected_max:g}] from DEFAULT_NORM."
-        )
-
-
-def count_rows(
-    conn: sqlite3.Connection,
-    table: str,
-    where_sql: str | None = None,
-    params: Iterable[object] = (),
-) -> int:
-    table_sql = quote_identifier(table)
-    sql = f"SELECT COUNT(*) FROM {table_sql}"
-    if where_sql:
-        sql += f" WHERE {where_sql}"
-    return int(conn.execute(sql, tuple(params)).fetchone()[0])
-
-
 def drop_condition_sql(radiation_column: str, drop_missing_radiation: bool) -> str:
     column_sql = quote_identifier(radiation_column)
     condition = f"{column_sql} < ?"
@@ -209,73 +142,113 @@ def drop_condition_sql(radiation_column: str, drop_missing_radiation: bool) -> s
     return condition
 
 
-def create_reindexed_table_sql(conn: sqlite3.Connection, table: str, tmp_table: str) -> str:
+def id_scan_bounds(conn: sqlite3.Connection, table: str) -> tuple[int, int] | None:
+    table_sql = quote_identifier(table)
     row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        f"SELECT id FROM {table_sql} LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return None
+
+    seq_row = conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = ?",
         (table,),
     ).fetchone()
-    if row is None or row[0] is None:
-        raise RuntimeError(f"Could not read CREATE TABLE SQL for {table!r}.")
+    if seq_row is not None and seq_row[0] is not None:
+        return 1, int(seq_row[0])
 
-    create_sql = row[0].strip()
-    match = re.match(
-        r"^(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)(?:\"[^\"]+\"|`[^`]+`|\[[^\]]+\]|\w+)",
-        create_sql,
-        flags=re.IGNORECASE,
-    )
-    if match is None:
-        raise RuntimeError(f"Could not rewrite CREATE TABLE SQL for {table!r}.")
-
-    return f"{match.group(1)}{quote_identifier(tmp_table)}{create_sql[match.end():]}"
+    max_row = conn.execute(
+        f"SELECT id FROM {table_sql} ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if max_row is None:
+        return None
+    return 1, int(max_row[0])
 
 
-def rebuild_ids(conn: sqlite3.Connection, table: str) -> None:
-    columns = table_columns(conn, table)
-    if "id" not in columns:
-        raise RuntimeError(f"Cannot rebuild ids because {table!r} has no id column.")
+def id_windows(min_id: int, max_id: int, chunk_size: int):
+    start_id = min_id
+    while start_id <= max_id:
+        end_id = min(start_id + chunk_size - 1, max_id)
+        yield start_id, end_id
+        start_id = end_id + 1
 
-    tmp_table = f"{table}__reindexed"
+
+def delete_nighttime_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    condition_sql: str,
+    threshold_in_storage_units: float,
+    chunk_size: int,
+) -> int:
+    bounds = id_scan_bounds(conn, table)
+    if bounds is None:
+        return 0
+
+    min_id, max_id = bounds
+    total_id_slots = max_id - min_id + 1
     table_sql = quote_identifier(table)
-    tmp_table_sql = quote_identifier(tmp_table)
-    copy_columns = [column for column in columns if column != "id"]
-    copy_columns_sql = ", ".join(quote_identifier(column) for column in copy_columns)
+    rows_dropped = 0
+    with scan_progress("drop_nighttime scan/delete", total_id_slots) as progress:
+        for start_id, end_id in id_windows(min_id, max_id, chunk_size):
+            progress.set_postfix(id=f"{start_id}-{end_id}", dropped=rows_dropped)
+            progress.refresh()
+            cursor = conn.execute(
+                f"""
+                DELETE FROM {table_sql}
+                WHERE id >= ?
+                  AND id <= ?
+                  AND {condition_sql}
+                """,
+                (start_id, end_id, threshold_in_storage_units),
+            )
+            rows_dropped += cursor.rowcount
+            progress.update(end_id - start_id + 1)
+            progress.set_postfix(id=f"{start_id}-{end_id}", dropped=rows_dropped)
+    return rows_dropped
 
-    order_columns = [
-        column for column in ("coord_id", "timestamp", "id") if column in columns
-    ]
-    order_sql = ", ".join(quote_identifier(column) for column in order_columns)
-    if not order_sql:
-        order_sql = quote_identifier("id")
 
-    index_sqls = [
-        row[0]
-        for row in conn.execute(
-            """
-            SELECT sql
-            FROM sqlite_master
-            WHERE type = 'index'
-              AND tbl_name = ?
-              AND sql IS NOT NULL
-            ORDER BY name
-            """,
-            (table,),
-        ).fetchall()
-    ]
+def count_nighttime_rows_by_id_scan(
+    conn: sqlite3.Connection,
+    table: str,
+    condition_sql: str,
+    threshold_in_storage_units: float,
+    chunk_size: int,
+) -> tuple[int, int]:
+    bounds = id_scan_bounds(conn, table)
+    if bounds is None:
+        return 0, 0
 
-    conn.execute(f"DROP TABLE IF EXISTS {tmp_table_sql}")
-    conn.execute(create_reindexed_table_sql(conn, table, tmp_table))
-    conn.execute(
-        f"""
-        INSERT INTO {tmp_table_sql} ({copy_columns_sql})
-        SELECT {copy_columns_sql}
-        FROM {table_sql}
-        ORDER BY {order_sql}
-        """
-    )
-    conn.execute(f"DROP TABLE {table_sql}")
-    conn.execute(f"ALTER TABLE {tmp_table_sql} RENAME TO {table_sql}")
-    for index_sql in index_sqls:
-        conn.execute(index_sql)
+    min_id, max_id = bounds
+    total_id_slots = max_id - min_id + 1
+    table_sql = quote_identifier(table)
+    rows_to_drop = 0
+    with scan_progress("drop_nighttime scan/count", total_id_slots) as progress:
+        for start_id, end_id in id_windows(min_id, max_id, chunk_size):
+            progress.set_postfix(id=f"{start_id}-{end_id}", matched=rows_to_drop)
+            progress.refresh()
+            rows_to_drop += int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {table_sql}
+                    WHERE id >= ?
+                      AND id <= ?
+                      AND {condition_sql}
+                    """,
+                    (start_id, end_id, threshold_in_storage_units),
+                ).fetchone()[0]
+            )
+            progress.update(end_id - start_id + 1)
+            progress.set_postfix(id=f"{start_id}-{end_id}", matched=rows_to_drop)
+    return total_id_slots, rows_to_drop
+
+
+def vacuum_database(conn: sqlite3.Connection) -> None:
+    row = conn.execute("PRAGMA page_count").fetchone()
+    total_pages = int(row[0]) if row else 0
+    with scan_progress("drop_nighttime vacuum", total_pages, unit="page") as progress:
+        conn.execute("VACUUM")
+        progress.update(total_pages)
 
 
 def main() -> int:
@@ -284,12 +257,6 @@ def main() -> int:
 
     db_path = args.db_path.expanduser().resolve()
     with sqlite3.connect(db_path) as conn:
-        require_table_and_column(conn, args.table, args.radiation_column)
-        validate_normalized_radiation_values(
-            conn,
-            args.table,
-            args.radiation_column,
-        )
         threshold_in_storage_units = normalized_threshold(
             args.radiation_column,
             args.threshold_w_m2,
@@ -299,39 +266,49 @@ def main() -> int:
             args.drop_missing_radiation,
         )
 
-        print(f"DB: {db_path}")
-        print(f"Table: {args.table}")
-        print(f"Radiation column: {args.radiation_column}")
-        print("Radiation units: normalized")
+        print(f"DB: {db_path}", flush=True)
+        print(f"Table: {args.table}", flush=True)
+        print(f"Radiation column: {args.radiation_column}", flush=True)
+        print("Radiation units: normalized", flush=True)
         print(
             f"Threshold: {args.threshold_w_m2:g} W m-2 "
-            f"({threshold_in_storage_units:g} in stored units)"
+            f"({threshold_in_storage_units:g} in stored units)",
+            flush=True,
         )
+        bounds = id_scan_bounds(conn, args.table)
+        if bounds is None:
+            print("ID scan range: empty table", flush=True)
+        else:
+            min_id, max_id = bounds
+            print(
+                f"ID scan range: {min_id}-{max_id} "
+                f"({max_id - min_id + 1} id values)",
+                flush=True,
+            )
+            print(f"Delete chunk size: {args.delete_chunk_size} id values", flush=True)
 
         if args.dry_run:
-            total_rows = count_rows(conn, args.table)
-            rows_to_drop = count_rows(
+            total_id_slots, rows_to_drop = count_nighttime_rows_by_id_scan(
                 conn,
                 args.table,
                 condition_sql,
-                (threshold_in_storage_units,),
+                threshold_in_storage_units,
+                args.delete_chunk_size,
             )
-            rows_to_keep = total_rows - rows_to_drop
-            print(f"Rows before: {total_rows}")
-            print(f"Rows to drop: {rows_to_drop}")
-            print(f"Rows to keep: {rows_to_keep}")
-            print("Dry run only; no rows were deleted.")
+            print(f"ID values scanned: {total_id_slots}", flush=True)
+            print(f"Rows to drop: {rows_to_drop}", flush=True)
+            print("Dry run only; no rows were deleted.", flush=True)
             return 0
 
         conn.execute("BEGIN")
         try:
-            cursor = conn.execute(
-                f"DELETE FROM {quote_identifier(args.table)} WHERE {condition_sql}",
-                (threshold_in_storage_units,),
+            rows_dropped = delete_nighttime_rows(
+                conn,
+                args.table,
+                condition_sql,
+                threshold_in_storage_units,
+                args.delete_chunk_size,
             )
-            rows_dropped = cursor.rowcount
-            if rows_dropped > 0 and not args.no_rebuild_ids:
-                rebuild_ids(conn, args.table)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -339,13 +316,12 @@ def main() -> int:
 
     if args.vacuum:
         with sqlite3.connect(db_path) as conn:
-            conn.execute("VACUUM")
+            vacuum_database(conn)
 
-    print(f"Dropped {rows_dropped} nighttime rows from {args.table}.")
-    if rows_dropped > 0 and not args.no_rebuild_ids:
-        print("Rebuilt ec_data ids ordered by coord_id, timestamp, id.")
+    print(f"Dropped {rows_dropped} nighttime rows from {args.table}.", flush=True)
+    print("Skipped id rebuild; run rebuild_ids_era5 after all filters.", flush=True)
     if args.vacuum:
-        print("Vacuumed database.")
+        print("Vacuumed database.", flush=True)
 
     return 0
 

@@ -618,7 +618,16 @@ def main() -> int:
             f"{sum(len(v) for v in coord_lookup.values())} {coord_scope} entries."
         )
 
-        for pair in pairs:
+        pair_iter = pairs
+        if tqdm is not None:
+            pair_iter = tqdm(
+                pairs,
+                desc="transform_modis dates",
+                unit="date",
+                dynamic_ncols=True,
+            )
+
+        for pair in pair_iter:
             transform_pair(pair=pair, reservoir=reservoir)
 
             stats = insert_pair_into_database(

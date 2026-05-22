@@ -1,7 +1,8 @@
 pipeline:
   steps:
     - drop_nighttime
-    - drop_areas
+    # - drop_areas
+    - rebuild_ids_era5
     - transform_modis
   include_download: false
   dry_run: false
@@ -20,14 +21,20 @@ drop_nighttime:
   radiation_column: SW_IN
   threshold_w_m2: 2.0
   drop_missing_radiation: false
-  rebuild_ids: true
+  delete_chunk_size: 1000000
   vacuum: false
   dry_run: false
 
 drop_areas:
   areas_config: scripts/modis/drop_areas_config.yml
   areas: []
-  rebuild_ids: true
+  delete_chunk_size: 1000000
+  vacuum: false
+  dry_run: false
+
+rebuild_ids_era5:
+  table: ec_data
+  copy_chunk_size: 100000
   vacuum: false
   dry_run: false
 
