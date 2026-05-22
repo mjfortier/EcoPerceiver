@@ -45,9 +45,9 @@ try:
 except ModuleNotFoundError:
     tqdm = None
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_INPUT_DIR = REPO_ROOT / "experiments" / "data" / "poc_modis"
-DEFAULT_DB_PATH = REPO_ROOT / "experiments" / "data" / "poc_era5.db"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_INPUT_DIR = REPO_ROOT / "experiments" / "data" / "raw_modis"
+DEFAULT_DB_PATH = Path("/home/l/luislara/links/projects/aip-pal/luislara/ep/data/era5.db")
 CELL_SIZE_DEGREES = 0.25
 CELL_SIZE_PIXELS = 8
 EXPECTED_GRID_WIDTH = 1440
@@ -181,6 +181,14 @@ def parse_args() -> argparse.Namespace:
             "`(coord_id, modis_date)`."
         ),
     )
+    parser.add_argument(
+        "--active-ec-coords-only",
+        action="store_true",
+        help=(
+            "Only insert MODIS rows for coord_id values that are still present "
+            "in ec_data. This is useful after filtering ec_data rows."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -272,11 +280,32 @@ def modis_date_from_timestamp(timestamp: str) -> int:
     return int(timestamp[:8])
 
 
-def load_coord_lookup(db_path: Path) -> dict[int, dict[int, int]]:
+def load_coord_lookup(
+    db_path: Path,
+    *,
+    active_ec_coords_only: bool = False,
+) -> dict[int, dict[int, int]]:
     with sqlite3.connect(db_path) as conn:
-        rows = conn.execute("SELECT coord_id, lat, lon FROM coord_data").fetchall()
+        if active_ec_coords_only:
+            rows = conn.execute(
+                """
+                SELECT coord_data.coord_id, coord_data.lat, coord_data.lon
+                FROM coord_data
+                INNER JOIN (
+                    SELECT DISTINCT coord_id
+                    FROM ec_data
+                ) AS active_ec_coords
+                ON active_ec_coords.coord_id = coord_data.coord_id
+                """
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT coord_id, lat, lon FROM coord_data").fetchall()
 
     if not rows:
+        if active_ec_coords_only:
+            raise RuntimeError(
+                f"No coord_data rows with matching ec_data rows were found in {db_path}."
+            )
         raise RuntimeError(f"`coord_data` is empty in {db_path}.")
 
     lookup: dict[int, dict[int, int]] = {}
@@ -579,10 +608,14 @@ def main() -> int:
         ensure_coord_table_key(conn)
         conn.execute("PRAGMA foreign_keys = ON")
         ensure_modis_table(conn)
-        coord_lookup = load_coord_lookup(args.db_path)
+        coord_lookup = load_coord_lookup(
+            args.db_path,
+            active_ec_coords_only=args.active_ec_coords_only,
+        )
+        coord_scope = "active ec_data coord_id" if args.active_ec_coords_only else "coord_id"
         print(
             f"Loaded coord lookup from {args.db_path} with "
-            f"{sum(len(v) for v in coord_lookup.values())} coord_id entries."
+            f"{sum(len(v) for v in coord_lookup.values())} {coord_scope} entries."
         )
 
         for pair in pairs:

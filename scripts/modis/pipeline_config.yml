@@ -1,0 +1,40 @@
+pipeline:
+  steps:
+    - drop_nighttime
+    - drop_areas
+    - transform_modis
+  include_download: false
+  dry_run: false
+  python: null
+  db_path: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/era5.db
+
+download_modis:
+  start_date: null
+  end_date: null
+  output_dir: experiments/data/raw_modis
+  products: null
+  overwrite: false
+  authenticate: false
+
+drop_nighttime:
+  radiation_column: SW_IN
+  threshold_w_m2: 2.0
+  drop_missing_radiation: false
+  rebuild_ids: true
+  vacuum: false
+  dry_run: false
+
+drop_areas:
+  areas_config: scripts/modis/drop_areas_config.yml
+  areas: []
+  rebuild_ids: true
+  vacuum: false
+  dry_run: false
+
+transform_modis:
+  input_dir: experiments/data/raw_modis
+  dates: []
+  limit_dates: null
+  example_count: 10
+  overwrite: false
+  active_ec_coords_only: true

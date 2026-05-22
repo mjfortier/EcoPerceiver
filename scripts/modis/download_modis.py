@@ -48,7 +48,7 @@ except ModuleNotFoundError:
     tqdm = None
 
 HIGH_VOLUME_URL = "https://earthengine-highvolume.googleapis.com"
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 # DEFAULT_OUTPUT_DIR = REPO_ROOT / "experiments" / "data" / "raw_modis"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "experiments" / "data" / "test_raw_modis"
 DEFAULT_PROJECT = "modis-488716"
