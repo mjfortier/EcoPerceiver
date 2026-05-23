@@ -21,7 +21,7 @@ drop_nighttime:
   radiation_column: SW_IN
   threshold_w_m2: 2.0
   drop_missing_radiation: false
-  delete_chunk_size: 1000000
+  chunk_size: 1000000
   vacuum: false
   dry_run: false
 
@@ -44,4 +44,4 @@ transform_modis:
   limit_dates: null
   example_count: 10
   overwrite: false
-  active_ec_coords_only: true
+  active_ec_coords_only: false

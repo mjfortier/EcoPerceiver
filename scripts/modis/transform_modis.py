@@ -24,6 +24,9 @@ from __future__ import annotations
 import argparse
 import re
 import sqlite3
+import sys
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
@@ -58,6 +61,9 @@ MODIS_FILE_RE = re.compile(r"^(?P<timestamp>\d{12})(?P<product>A2|A4)\.tiff$")
 DEFAULT_HEAD_ELEMENTS = 24
 GRID_KEY_SCALE = 4
 COORD_ID_UNIQUE_INDEX = "idx_coord_data_coord_id"
+EC_COORD_ID_INDEX = "idx_ec_data_coord_id"
+SQLITE_HEARTBEAT_SECONDS = 15.0
+SQLITE_PROGRESS_OPCODES = 100_000
 
 # Same remapping as stage_3.py.
 WATER_DICT = {
@@ -117,6 +123,40 @@ class ExampleReservoir:
 class DbInsertStats:
     matched_coords: int = 0
     inserted_or_updated_rows: int = 0
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
+@contextmanager
+def sqlite_heartbeat(conn: sqlite3.Connection, label: str):
+    start = time.monotonic()
+    last = start
+
+    def progress() -> int:
+        nonlocal last
+        now = time.monotonic()
+        if now - last >= SQLITE_HEARTBEAT_SECONDS:
+            print(
+                f"{label}: still running elapsed={format_duration(now - start)}",
+                flush=True,
+            )
+            last = now
+        return 0
+
+    conn.set_progress_handler(progress, SQLITE_PROGRESS_OPCODES)
+    try:
+        yield
+    finally:
+        conn.set_progress_handler(None, 0)
 
 
 def ensure_dependencies() -> None:
@@ -280,33 +320,71 @@ def modis_date_from_timestamp(timestamp: str) -> int:
     return int(timestamp[:8])
 
 
+def quote_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def index_has_leading_column(
+    conn: sqlite3.Connection,
+    *,
+    table: str,
+    column: str,
+) -> bool:
+    for index_row in conn.execute(f"PRAGMA index_list({quote_identifier(table)})"):
+        index_name = index_row[1]
+        index_columns = [
+            column_row[2]
+            for column_row in conn.execute(
+                f"PRAGMA index_info({quote_identifier(index_name)})"
+            )
+        ]
+        if index_columns and index_columns[0] == column:
+            return True
+    return False
+
+
 def load_coord_lookup(
-    db_path: Path,
+    conn: sqlite3.Connection,
     *,
     active_ec_coords_only: bool = False,
 ) -> dict[int, dict[int, int]]:
-    with sqlite3.connect(db_path) as conn:
-        if active_ec_coords_only:
+    if active_ec_coords_only:
+        if not index_has_leading_column(conn, table="ec_data", column="coord_id"):
+            print(
+                "Creating ec_data(coord_id) index for active MODIS coord lookup...",
+                flush=True,
+            )
+            with sqlite_heartbeat(conn, "Creating ec_data(coord_id) index"):
+                conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS {quote_identifier(EC_COORD_ID_INDEX)} "
+                    "ON ec_data(coord_id)"
+                )
+            conn.commit()
+            print("Created ec_data(coord_id) index.", flush=True)
+
+        with sqlite_heartbeat(conn, "Loading active MODIS coord lookup"):
             rows = conn.execute(
                 """
                 SELECT coord_data.coord_id, coord_data.lat, coord_data.lon
                 FROM coord_data
-                INNER JOIN (
-                    SELECT DISTINCT coord_id
+                WHERE EXISTS (
+                    SELECT 1
                     FROM ec_data
-                ) AS active_ec_coords
-                ON active_ec_coords.coord_id = coord_data.coord_id
+                    WHERE ec_data.coord_id = coord_data.coord_id
+                    LIMIT 1
+                )
                 """
             ).fetchall()
-        else:
+    else:
+        with sqlite_heartbeat(conn, "Loading full MODIS coord lookup"):
             rows = conn.execute("SELECT coord_id, lat, lon FROM coord_data").fetchall()
 
     if not rows:
         if active_ec_coords_only:
             raise RuntimeError(
-                f"No coord_data rows with matching ec_data rows were found in {db_path}."
+                "No coord_data rows with matching ec_data rows were found."
             )
-        raise RuntimeError(f"`coord_data` is empty in {db_path}.")
+        raise RuntimeError("`coord_data` is empty.")
 
     lookup: dict[int, dict[int, int]] = {}
     for coord_id, lat, lon in rows:
@@ -414,6 +492,8 @@ def insert_pair_into_database(
     pair: FilePair,
     coord_lookup: dict[int, dict[int, int]],
     overwrite: bool,
+    *,
+    reservoir: ExampleReservoir | None = None,
 ) -> DbInsertStats:
     matched_coords = 0
     before_changes = conn.total_changes
@@ -430,40 +510,31 @@ def insert_pair_into_database(
             "ON CONFLICT(coord_id, modis_date) DO NOTHING"
         )
 
-    row_iter: Iterator[tuple[int, np.ndarray]] = iter_cell_rows(pair)
-    if tqdm is not None:
-        row_iter = tqdm(
-            row_iter,
-            total=EXPECTED_GRID_HEIGHT,
-            desc=f"DB {pair.timestamp}",
-            unit="row",
-            dynamic_ncols=True,
-        )
+    for grid_row, cell_row in iter_cell_rows(pair):
+        if reservoir is not None:
+            collect_examples(reservoir, pair.timestamp, grid_row, cell_row)
 
-    for grid_row, cell_row in row_iter:
         lat_min, _ = row_bounds(grid_row)
         lon_lookup = coord_lookup.get(grid_key(lat_min))
-        if lon_lookup is None:
-            continue
+        if lon_lookup is not None:
+            row_records: list[tuple[int, int, memoryview]] = []
+            for grid_col, cell in enumerate(cell_row):
+                lon_min, _ = col_bounds(grid_col)
+                coord_id = lon_lookup.get(grid_key(lon_min))
+                if coord_id is None:
+                    continue
 
-        row_records: list[tuple[int, int, memoryview]] = []
-        for grid_col, cell in enumerate(cell_row):
-            lon_min, _ = col_bounds(grid_col)
-            coord_id = lon_lookup.get(grid_key(lon_min))
-            if coord_id is None:
-                continue
-
-            matched_coords += 1
-            row_records.append(
-                (
-                    coord_id,
-                    modis_date,
-                    memoryview(np.ascontiguousarray(cell, dtype=np.float32)),
+                matched_coords += 1
+                row_records.append(
+                    (
+                        coord_id,
+                        modis_date,
+                        memoryview(np.ascontiguousarray(cell, dtype=np.float32)),
+                    )
                 )
-            )
 
-        if row_records:
-            conn.executemany(insert_sql, row_records)
+            if row_records:
+                conn.executemany(insert_sql, row_records)
 
     conn.commit()
     return DbInsertStats(
@@ -528,24 +599,6 @@ def collect_examples(
         reservoir.add(example)
 
 
-def transform_pair(
-    pair: FilePair,
-    reservoir: ExampleReservoir,
-) -> None:
-    row_iter: Iterator[tuple[int, np.ndarray]] = iter_cell_rows(pair)
-    if tqdm is not None:
-        row_iter = tqdm(
-            row_iter,
-            total=EXPECTED_GRID_HEIGHT,
-            desc=f"{pair.timestamp}",
-            unit="row",
-            dynamic_ncols=True,
-        )
-
-    for grid_row, cell_row in row_iter:
-        collect_examples(reservoir, pair.timestamp, grid_row, cell_row)
-
-
 def print_examples(examples: list[ExampleCell], requested_count: int) -> None:
     if not examples:
         print("No example cells were collected.")
@@ -597,50 +650,70 @@ def main() -> int:
     print(
         f"Found {len(pairs)} paired timestamp(s) in {args.input_dir}. "
         f"Transforming into {EXPECTED_GRID_HEIGHT}x{EXPECTED_GRID_WIDTH} cells "
-        f"of shape 9x8x8."
+        f"of shape 9x8x8.",
+        flush=True,
     )
 
     reservoir = ExampleReservoir(
         size=args.example_count,
         rng=np.random.default_rng(),
     )
+    print(f"Preparing SQLite database {args.db_path}...", flush=True)
     with sqlite3.connect(args.db_path) as conn:
         ensure_coord_table_key(conn)
         conn.execute("PRAGMA foreign_keys = ON")
         ensure_modis_table(conn)
+        coord_scope = "active ec_data coord_id" if args.active_ec_coords_only else "coord_id"
         coord_lookup = load_coord_lookup(
-            args.db_path,
+            conn,
             active_ec_coords_only=args.active_ec_coords_only,
         )
-        coord_scope = "active ec_data coord_id" if args.active_ec_coords_only else "coord_id"
         print(
-            f"Loaded coord lookup from {args.db_path} with "
-            f"{sum(len(v) for v in coord_lookup.values())} {coord_scope} entries."
+            f"Loaded coord lookup with "
+            f"{sum(len(v) for v in coord_lookup.values())} {coord_scope} entries.",
+            flush=True,
         )
 
+        progress = None
         pair_iter = pairs
         if tqdm is not None:
-            pair_iter = tqdm(
+            progress = tqdm(
                 pairs,
-                desc="transform_modis dates",
+                total=len(pairs),
+                desc="transform_modis",
                 unit="date",
                 dynamic_ncols=True,
+                file=sys.stdout,
             )
+            pair_iter = progress
 
-        for pair in pair_iter:
-            transform_pair(pair=pair, reservoir=reservoir)
-
+        for date_index, pair in enumerate(pair_iter, start=1):
+            if progress is not None:
+                progress.set_postfix(timestamp=pair.timestamp, refresh=True)
             stats = insert_pair_into_database(
                 conn=conn,
                 pair=pair,
                 coord_lookup=coord_lookup,
                 overwrite=args.overwrite,
+                reservoir=reservoir,
             )
-            print(
-                f"Inserted MODIS for {pair.timestamp}: "
-                f"matched {stats.matched_coords} coord rows, "
-                f"wrote {stats.inserted_or_updated_rows} rows into modis_data."
-            )
+            if progress is not None:
+                progress.set_postfix(
+                    timestamp=pair.timestamp,
+                    matched=stats.matched_coords,
+                    wrote=stats.inserted_or_updated_rows,
+                    refresh=True,
+                )
+            else:
+                print(
+                    f"transform_modis: {date_index}/{len(pairs)} date "
+                    f"timestamp={pair.timestamp} matched={stats.matched_coords} "
+                    f"wrote={stats.inserted_or_updated_rows}",
+                    flush=True,
+                )
+
+        if progress is not None:
+            progress.close()
 
     print_examples(reservoir.examples, args.example_count)
 

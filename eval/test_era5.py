@@ -1,7 +1,70 @@
 import argparse
 import csv
+from datetime import datetime, time
 from pathlib import Path
 from utils import resolve_checkpoint_path, resolve_config_path, resolve_device
+
+DATE_ONLY_FORMATS = ("%Y-%m-%d", "%Y%m%d")
+DATETIME_FORMATS = (
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y%m%d%H%M%S",
+    "%Y-%m-%dT%H:%M",
+    "%Y-%m-%d %H:%M",
+    "%Y%m%d%H%M",
+)
+
+
+def parse_era5_date_bound(value: str, *, is_end: bool) -> tuple[int, str]:
+    raw_value = value.strip()
+    for date_format in DATE_ONLY_FORMATS:
+        try:
+            parsed_date = datetime.strptime(raw_value, date_format).date()
+        except ValueError:
+            continue
+
+        bound_time = time(23, 59, 59) if is_end else time(0, 0, 0)
+        timestamp = datetime.combine(parsed_date, bound_time)
+        return int(timestamp.strftime("%Y%m%d%H%M%S")), parsed_date.strftime("%Y%m%d")
+
+    for date_format in DATETIME_FORMATS:
+        try:
+            timestamp = datetime.strptime(raw_value, date_format)
+        except ValueError:
+            continue
+
+        return int(timestamp.strftime("%Y%m%d%H%M%S")), timestamp.strftime("%Y%m%d%H%M%S")
+
+    raise ValueError(
+        f"Invalid date '{value}'. Use YYYY-MM-DD, YYYYMMDD, or a full timestamp like YYYYMMDDHHMMSS."
+    )
+
+
+def build_date_filter(args: argparse.Namespace) -> tuple[int | None, int | None, str | None]:
+    start_timestamp = None
+    end_timestamp = None
+    start_label = None
+    end_label = None
+
+    if args.start_date is not None:
+        start_timestamp, start_label = parse_era5_date_bound(args.start_date, is_end=False)
+    if args.end_date is not None:
+        end_timestamp, end_label = parse_era5_date_bound(args.end_date, is_end=True)
+
+    if start_timestamp is not None and end_timestamp is not None and end_timestamp < start_timestamp:
+        raise ValueError("--end-date/--final-date must be on or after --start-date/--initial-date.")
+
+    if start_label is None and end_label is None:
+        date_tag = None
+    else:
+        date_tag = f"{start_label or 'start'}_to_{end_label or 'end'}"
+
+    return start_timestamp, end_timestamp, date_tag
+
+
+def default_output_csv_path(run_path: Path, date_tag: str | None) -> Path:
+    filename = "era5_predictions.csv" if date_tag is None else f"era5_predictions_{date_tag}.csv"
+    return run_path / "eval" / filename
 
 
 def parse_args():
@@ -22,13 +85,39 @@ def parse_args():
         "--checkpoint-path",
         type=Path,
         default=None,
-        help="Path to checkpoint file. Relative paths resolve from <run_path> (default: run_path/last.pth, else latest checkpoint-*.pth).",
+        help=(
+            "Path to checkpoint file. Relative paths resolve from <run_path> "
+            "(default: run_path/last.pth, else latest checkpoint-*.pth)."
+        ),
     )
     parser.add_argument(
         "--output-csv",
         type=Path,
         default=None,
-        help="Output CSV path (default: <run_path>/eval/era5_predictions.csv).",
+        help=(
+            "Output CSV path. Default is <run_path>/eval/era5_predictions.csv, "
+            "or era5_predictions_<start>_to_<end>.csv when date bounds are provided."
+        ),
+    )
+    parser.add_argument(
+        "--start-date",
+        "--initial-date",
+        dest="start_date",
+        default=None,
+        help=(
+            "Inclusive ERA5 start date. Accepts YYYY-MM-DD, YYYYMMDD, or full "
+            "YYYYMMDDHHMMSS timestamp."
+        ),
+    )
+    parser.add_argument(
+        "--end-date",
+        "--final-date",
+        dest="end_date",
+        default=None,
+        help=(
+            "Inclusive ERA5 end date. Date-only values include the whole day. "
+            "Accepts YYYY-MM-DD, YYYYMMDD, or full YYYYMMDDHHMMSS timestamp."
+        ),
     )
     parser.add_argument(
         "--max-samples",
@@ -65,6 +154,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    try:
+        start_timestamp, end_timestamp, date_tag = build_date_filter(args)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
     import torch
     import yaml
     from torch.utils.data import DataLoader, Subset
@@ -86,7 +180,7 @@ def main():
     if not db_path.exists():
         raise FileNotFoundError(f"SQLite database not found: {db_path}")
     output_csv_path = (
-        (run_path / "eval" / "era5_predictions.csv")
+        default_output_csv_path(run_path, date_tag)
         if args.output_csv is None
         else args.output_csv.resolve()
     )
@@ -104,6 +198,8 @@ def main():
     print(f"Checkpoint path: {checkpoint_path}")
     print(f"Data path: {data_path}")
     print(f"DB path: {db_path}")
+    if start_timestamp is not None or end_timestamp is not None:
+        print(f"ERA5 date filter: {start_timestamp or 'start'} to {end_timestamp or 'end'}")
 
     model_config = EcoPerceiverConfig(**config["model"])
     relative_pretrained_path = repo_root / "ecoperceiver" / "resnet18_weights.pth"
@@ -120,7 +216,13 @@ def main():
     print(f"Model moved to {device} and set to evaluation mode")
 
     dataset_config = EcoPerceiverLoaderConfig(**config["dataset"])
-    dataset = ERA5Dataset(data_path, config=dataset_config, sql_file=db_path)
+    dataset = ERA5Dataset(
+        data_path,
+        config=dataset_config,
+        sql_file=db_path,
+        start_timestamp=start_timestamp,
+        end_timestamp=end_timestamp,
+    )
     if args.max_samples is None:
         max_samples = len(dataset)
     else:

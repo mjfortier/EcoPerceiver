@@ -394,10 +394,17 @@ def add_drop_nighttime_args(
         help="Run the nighttime filter in dry-run mode even when the pipeline runs.",
     )
     group.add_argument(
-        "--nighttime-delete-chunk-size",
+        "--nighttime-chunk-size",
+        dest="nighttime_chunk_size",
         type=int,
-        default=config.get("delete_chunk_size", 250_000),
-        help="Number of id values scanned per drop_nighttime delete chunk.",
+        default=config.get("chunk_size", config.get("delete_chunk_size", 250_000)),
+        help="Number of id values scanned per drop_nighttime rewrite chunk.",
+    )
+    group.add_argument(
+        "--nighttime-delete-chunk-size",
+        dest="nighttime_chunk_size",
+        type=int,
+        help=argparse.SUPPRESS,
     )
 
 
@@ -579,8 +586,8 @@ def drop_nighttime_command(args: argparse.Namespace) -> list[str]:
         args.radiation_column,
         "--threshold-w-m2",
         str(args.threshold_w_m2),
-        "--delete-chunk-size",
-        str(args.nighttime_delete_chunk_size),
+        "--chunk-size",
+        str(args.nighttime_chunk_size),
     ]
     if args.drop_missing_radiation:
         command.append("--drop-missing-radiation")

@@ -47,11 +47,15 @@ class ERA5Dataset(Dataset):
         data_dir: Union[str, os.PathLike],
         config: EcoPerceiverLoaderConfig,
         sql_file: Union[str, os.PathLike, None] = None,
+        start_timestamp: Optional[int] = None,
+        end_timestamp: Optional[int] = None,
     ):
         self.data_path = Path(data_dir)
         self.config = config
         self.columns = ('id', 'coord_id', 'timestamp') + tuple(self.config.predictors)
         self.window_len = self.config.context_length
+        self.start_timestamp = start_timestamp
+        self.end_timestamp = end_timestamp
         self.sql_file = (
             Path(sql_file).expanduser().resolve()
             if sql_file is not None
@@ -81,12 +85,21 @@ class ERA5Dataset(Dataset):
             self.data = self._build_sample_index(conn)
 
     def _build_sample_index(self, conn: sqlite3.Connection) -> np.ndarray:
+        filters = []
+        params = []
+        if self.end_timestamp is not None:
+            filters.append("timestamp <= ?")
+            params.append(int(self.end_timestamp))
+        where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
+
         cursor = conn.execute(
-            """
-            SELECT id, coord_id
+            f"""
+            SELECT id, coord_id, timestamp
             FROM ec_data
+            {where_sql}
             ORDER BY coord_id, id;
-            """
+            """,
+            params,
         )
         indexes = []
         current_coord_id = None
@@ -96,12 +109,14 @@ class ERA5Dataset(Dataset):
             rows = cursor.fetchmany(self._INDEX_FETCH_SIZE)
             if not rows:
                 break
-            for row_id, coord_id in rows:
+            for row_id, coord_id, timestamp in rows:
                 if coord_id != current_coord_id:
                     current_coord_id = coord_id
                     coord_count = 1
                 else:
                     coord_count += 1
+                if self.start_timestamp is not None and timestamp < self.start_timestamp:
+                    continue
                 if coord_count >= self.config.context_length:
                     indexes.append(row_id)
 

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+from dataclasses import dataclass
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -30,7 +32,13 @@ DEFAULT_DB_PATH = Path("/home/l/luislara/links/projects/aip-pal/luislara/ep/data
 DEFAULT_TABLE = "ec_data"
 DEFAULT_RADIATION_COLUMN = "SW_IN"
 DEFAULT_THRESHOLD_W_M2 = 2.0
-DEFAULT_DELETE_CHUNK_SIZE = 250_000
+DEFAULT_CHUNK_SIZE = 250_000
+
+
+@dataclass(frozen=True)
+class RewriteResult:
+    id_slots_scanned: int
+    rows_kept: int
 
 
 class NullProgress:
@@ -54,9 +62,9 @@ def quote_identifier(identifier: str) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Drop rows from ec_data where solar radiation is below a daytime "
-            "threshold. By default this removes nighttime rows with "
-            "SW_IN < 2 W m-2."
+            "Rewrite ec_data with only daytime rows where solar radiation is "
+            "at or above the requested threshold. By default this removes "
+            "nighttime rows with SW_IN < 2 W m-2."
         )
     )
     parser.add_argument(
@@ -89,21 +97,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vacuum",
         action="store_true",
-        help="Run VACUUM after deleting rows to reclaim disk space.",
+        help="Run VACUUM after rewriting rows to reclaim disk space.",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print how many rows would be dropped without changing the DB.",
+        help="Print how many rows would be kept without changing the DB.",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        dest="chunk_size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help=(
+            "Number of id values to scan per rewrite chunk. "
+            f"Default: {DEFAULT_CHUNK_SIZE}."
+        ),
     )
     parser.add_argument(
         "--delete-chunk-size",
+        dest="chunk_size",
         type=int,
-        default=DEFAULT_DELETE_CHUNK_SIZE,
-        help=(
-            "Number of id values to scan per delete chunk. "
-            f"Default: {DEFAULT_DELETE_CHUNK_SIZE}."
-        ),
+        help=argparse.SUPPRESS,
     )
     return parser.parse_args()
 
@@ -111,8 +126,8 @@ def parse_args() -> argparse.Namespace:
 def ensure_valid_args(args: argparse.Namespace) -> None:
     if args.threshold_w_m2 < 0:
         raise SystemExit("--threshold-w-m2 must be non-negative.")
-    if args.delete_chunk_size < 1:
-        raise SystemExit("--delete-chunk-size must be at least 1.")
+    if args.chunk_size < 1:
+        raise SystemExit("--chunk-size must be at least 1.")
     if not args.db_path.exists():
         raise SystemExit(f"Database does not exist: {args.db_path}")
 
@@ -134,12 +149,59 @@ def normalized_threshold(column: str, threshold_w_m2: float) -> float:
     return (threshold_w_m2 - value_mid) / value_range
 
 
-def drop_condition_sql(radiation_column: str, drop_missing_radiation: bool) -> str:
+def keep_condition_sql(radiation_column: str, drop_missing_radiation: bool) -> str:
     column_sql = quote_identifier(radiation_column)
-    condition = f"{column_sql} < ?"
     if drop_missing_radiation:
-        condition = f"({condition} OR {column_sql} IS NULL)"
-    return condition
+        return f"{column_sql} >= ?"
+    return f"({column_sql} >= ? OR {column_sql} IS NULL)"
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    rows = conn.execute(f"PRAGMA table_info({quote_identifier(table)})").fetchall()
+    if not rows:
+        raise RuntimeError(f"Could not read columns for table {table!r}.")
+    return [row[1] for row in rows]
+
+
+def table_index_sqls(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [
+        row[0]
+        for row in conn.execute(
+            """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type = 'index'
+              AND tbl_name = ?
+              AND sql IS NOT NULL
+            ORDER BY name
+            """,
+            (table,),
+        ).fetchall()
+    ]
+
+
+def create_rewrite_table_sql(
+    conn: sqlite3.Connection,
+    table: str,
+    tmp_table: str,
+) -> str:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    if row is None or row[0] is None:
+        raise RuntimeError(f"Could not read CREATE TABLE SQL for {table!r}.")
+
+    create_sql = row[0].strip()
+    match = re.match(
+        r"^(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)(?:\"[^\"]+\"|`[^`]+`|\[[^\]]+\]|\w+)",
+        create_sql,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        raise RuntimeError(f"Could not rewrite CREATE TABLE SQL for {table!r}.")
+
+    return f"{match.group(1)}{quote_identifier(tmp_table)}{create_sql[match.end():]}"
 
 
 def id_scan_bounds(conn: sqlite3.Connection, table: str) -> tuple[int, int] | None:
@@ -173,44 +235,10 @@ def id_windows(min_id: int, max_id: int, chunk_size: int):
         start_id = end_id + 1
 
 
-def delete_nighttime_rows(
+def count_rewrite_rows_by_id_scan(
     conn: sqlite3.Connection,
     table: str,
-    condition_sql: str,
-    threshold_in_storage_units: float,
-    chunk_size: int,
-) -> int:
-    bounds = id_scan_bounds(conn, table)
-    if bounds is None:
-        return 0
-
-    min_id, max_id = bounds
-    total_id_slots = max_id - min_id + 1
-    table_sql = quote_identifier(table)
-    rows_dropped = 0
-    with scan_progress("drop_nighttime scan/delete", total_id_slots) as progress:
-        for start_id, end_id in id_windows(min_id, max_id, chunk_size):
-            progress.set_postfix(id=f"{start_id}-{end_id}", dropped=rows_dropped)
-            progress.refresh()
-            cursor = conn.execute(
-                f"""
-                DELETE FROM {table_sql}
-                WHERE id >= ?
-                  AND id <= ?
-                  AND {condition_sql}
-                """,
-                (start_id, end_id, threshold_in_storage_units),
-            )
-            rows_dropped += cursor.rowcount
-            progress.update(end_id - start_id + 1)
-            progress.set_postfix(id=f"{start_id}-{end_id}", dropped=rows_dropped)
-    return rows_dropped
-
-
-def count_nighttime_rows_by_id_scan(
-    conn: sqlite3.Connection,
-    table: str,
-    condition_sql: str,
+    keep_sql: str,
     threshold_in_storage_units: float,
     chunk_size: int,
 ) -> tuple[int, int]:
@@ -221,26 +249,101 @@ def count_nighttime_rows_by_id_scan(
     min_id, max_id = bounds
     total_id_slots = max_id - min_id + 1
     table_sql = quote_identifier(table)
-    rows_to_drop = 0
-    with scan_progress("drop_nighttime scan/count", total_id_slots) as progress:
+    rows_to_keep = 0
+    with scan_progress("drop_nighttime rewrite/count", total_id_slots) as progress:
         for start_id, end_id in id_windows(min_id, max_id, chunk_size):
-            progress.set_postfix(id=f"{start_id}-{end_id}", matched=rows_to_drop)
+            progress.set_postfix(id=f"{start_id}-{end_id}", kept=rows_to_keep)
             progress.refresh()
-            rows_to_drop += int(
+            rows_to_keep += int(
                 conn.execute(
                     f"""
                     SELECT COUNT(*)
                     FROM {table_sql}
                     WHERE id >= ?
                       AND id <= ?
-                      AND {condition_sql}
+                      AND {keep_sql}
                     """,
                     (start_id, end_id, threshold_in_storage_units),
                 ).fetchone()[0]
             )
             progress.update(end_id - start_id + 1)
-            progress.set_postfix(id=f"{start_id}-{end_id}", matched=rows_to_drop)
-    return total_id_slots, rows_to_drop
+            progress.set_postfix(id=f"{start_id}-{end_id}", kept=rows_to_keep)
+    return total_id_slots, rows_to_keep
+
+
+def rewrite_without_nighttime_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    keep_sql: str,
+    threshold_in_storage_units: float,
+    chunk_size: int,
+) -> RewriteResult:
+    bounds = id_scan_bounds(conn, table)
+    if bounds is None:
+        return RewriteResult(id_slots_scanned=0, rows_kept=0)
+
+    columns = table_columns(conn, table)
+    if "id" not in columns:
+        raise RuntimeError(f"Cannot rewrite {table!r} because it has no id column.")
+
+    min_id, max_id = bounds
+    total_id_slots = max_id - min_id + 1
+    tmp_table = f"{table}__drop_nighttime_rewrite"
+    table_sql = quote_identifier(table)
+    tmp_table_sql = quote_identifier(tmp_table)
+    columns_sql = ", ".join(quote_identifier(column) for column in columns)
+    index_sqls = table_index_sqls(conn, table)
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(f"DROP TABLE IF EXISTS {tmp_table_sql}")
+        conn.execute(create_rewrite_table_sql(conn, table, tmp_table))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    rows_kept = 0
+    insert_select_sql = f"""
+        INSERT INTO {tmp_table_sql} ({columns_sql})
+        SELECT {columns_sql}
+        FROM {table_sql}
+        WHERE id >= ?
+          AND id <= ?
+          AND {keep_sql}
+        ORDER BY id
+    """
+    with scan_progress("drop_nighttime rewrite/keep", total_id_slots) as progress:
+        for start_id, end_id in id_windows(min_id, max_id, chunk_size):
+            progress.set_postfix(id=f"{start_id}-{end_id}", kept=rows_kept)
+            progress.refresh()
+            before_changes = conn.total_changes
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    insert_select_sql,
+                    (start_id, end_id, threshold_in_storage_units),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            rows_kept += conn.total_changes - before_changes
+            progress.update(end_id - start_id + 1)
+            progress.set_postfix(id=f"{start_id}-{end_id}", kept=rows_kept)
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(f"DROP TABLE {table_sql}")
+        conn.execute(f"ALTER TABLE {tmp_table_sql} RENAME TO {table_sql}")
+        for index_sql in index_sqls:
+            conn.execute(index_sql)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return RewriteResult(id_slots_scanned=total_id_slots, rows_kept=rows_kept)
 
 
 def vacuum_database(conn: sqlite3.Connection) -> None:
@@ -261,7 +364,7 @@ def main() -> int:
             args.radiation_column,
             args.threshold_w_m2,
         )
-        condition_sql = drop_condition_sql(
+        keep_sql = keep_condition_sql(
             args.radiation_column,
             args.drop_missing_radiation,
         )
@@ -285,41 +388,42 @@ def main() -> int:
                 f"({max_id - min_id + 1} id values)",
                 flush=True,
             )
-            print(f"Delete chunk size: {args.delete_chunk_size} id values", flush=True)
+            print(f"Rewrite chunk size: {args.chunk_size} id values", flush=True)
 
         if args.dry_run:
-            total_id_slots, rows_to_drop = count_nighttime_rows_by_id_scan(
+            total_id_slots, rows_to_keep = count_rewrite_rows_by_id_scan(
                 conn,
                 args.table,
-                condition_sql,
+                keep_sql,
                 threshold_in_storage_units,
-                args.delete_chunk_size,
+                args.chunk_size,
             )
             print(f"ID values scanned: {total_id_slots}", flush=True)
-            print(f"Rows to drop: {rows_to_drop}", flush=True)
-            print("Dry run only; no rows were deleted.", flush=True)
+            print(f"Rows to keep: {rows_to_keep}", flush=True)
+            print("Dry run only; no rows were rewritten.", flush=True)
             return 0
 
-        conn.execute("BEGIN")
-        try:
-            rows_dropped = delete_nighttime_rows(
-                conn,
-                args.table,
-                condition_sql,
-                threshold_in_storage_units,
-                args.delete_chunk_size,
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+        rewrite_result = rewrite_without_nighttime_rows(
+            conn,
+            args.table,
+            keep_sql,
+            threshold_in_storage_units,
+            args.chunk_size,
+        )
+        result_message = (
+            f"Rewrote {args.table}: scanned {rewrite_result.id_slots_scanned} "
+            f"id slots and kept {rewrite_result.rows_kept} daytime rows."
+        )
+        id_rebuild_message = (
+            "Preserved existing ids; run rebuild_ids_era5 after all filters."
+        )
 
     if args.vacuum:
         with sqlite3.connect(db_path) as conn:
             vacuum_database(conn)
 
-    print(f"Dropped {rows_dropped} nighttime rows from {args.table}.", flush=True)
-    print("Skipped id rebuild; run rebuild_ids_era5 after all filters.", flush=True)
+    print(result_message, flush=True)
+    print(id_rebuild_message, flush=True)
     if args.vacuum:
         print("Vacuumed database.", flush=True)
 
