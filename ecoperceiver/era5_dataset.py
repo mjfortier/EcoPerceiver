@@ -49,6 +49,7 @@ class ERA5Dataset(Dataset):
         sql_file: Union[str, os.PathLike, None] = None,
         start_timestamp: Optional[int] = None,
         end_timestamp: Optional[int] = None,
+        exclude_igbp: Optional[Tuple[str, ...]] = None,
     ):
         self.data_path = Path(data_dir)
         self.config = config
@@ -56,6 +57,9 @@ class ERA5Dataset(Dataset):
         self.window_len = self.config.context_length
         self.start_timestamp = start_timestamp
         self.end_timestamp = end_timestamp
+        self.exclude_igbp = tuple(
+            dict.fromkeys(code.strip().upper() for code in (exclude_igbp or ()) if code.strip())
+        )
         self.sql_file = (
             Path(sql_file).expanduser().resolve()
             if sql_file is not None
@@ -102,16 +106,26 @@ class ERA5Dataset(Dataset):
         filters = []
         params = []
         if self.end_timestamp is not None:
-            filters.append("timestamp <= ?")
+            filters.append("ec.timestamp <= ?")
             params.append(int(self.end_timestamp))
+        if self.exclude_igbp:
+            placeholders = ",".join("?" for _ in self.exclude_igbp)
+            filters.append(
+                "NOT EXISTS ("
+                "SELECT 1 FROM coord_data coord "
+                "WHERE coord.coord_id = ec.coord_id "
+                f"AND coord.igbp IN ({placeholders})"
+                ")"
+            )
+            params.extend(self.exclude_igbp)
         where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
 
         cursor = conn.execute(
             f"""
-            SELECT id, coord_id, timestamp
-            FROM ec_data
+            SELECT ec.id, ec.coord_id, ec.timestamp
+            FROM ec_data ec
             {where_sql}
-            ORDER BY coord_id, timestamp, id;
+            ORDER BY ec.coord_id, ec.timestamp, ec.id;
             """,
             params,
         )

@@ -39,7 +39,7 @@ NATURAL_EARTH_COUNTRIES_URL = (
     "geojson/ne_110m_admin_0_countries.geojson"
 )
 NULL_LABEL = "NULL"
-BACKGROUND_LABELS = {"WAT", "SNO", "BSV"}
+EXCLUDED_LABELS = {"WAT", "SNO", "BSV", "URB", "CRO"}
 
 IGBP_ORDER = (
     NULL_LABEL,
@@ -450,7 +450,7 @@ def category_order(counts: Counter[str]) -> list[str]:
 
 
 def legend_order(counts: Counter[str]) -> list[str]:
-    return [label for label in category_order(counts) if label not in BACKGROUND_LABELS]
+    return [label for label in category_order(counts) if label not in EXCLUDED_LABELS]
 
 
 def color_for_label(label: str, fallback_index: int = 0) -> str:
@@ -718,15 +718,11 @@ def draw_points(
     for x, y, label in zip(px.tolist(), py.tolist(), labels):
         points_by_label[label].append((x, y))
 
-    draw_order = []
-    for label in IGBP_ORDER:
-        if label in BACKGROUND_LABELS and label in points_by_label:
-            draw_order.append(label)
-    draw_order.extend(
+    draw_order = [
         label
         for label in category_order(counts)
-        if label not in BACKGROUND_LABELS | {NULL_LABEL} and label in points_by_label
-    )
+        if label not in EXCLUDED_LABELS | {NULL_LABEL} and label in points_by_label
+    ]
     if NULL_LABEL in points_by_label:
         draw_order.append(NULL_LABEL)
 

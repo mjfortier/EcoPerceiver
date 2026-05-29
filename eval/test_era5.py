@@ -149,6 +149,13 @@ def parse_args():
         default=1,
         help="Number of batches prefetched by each dataloader worker.",
     )
+    parser.add_argument(
+        "--exclude-igbp",
+        nargs="+",
+        default=(),
+        metavar="CODE",
+        help="IGBP code(s) to exclude from ERA5 inference.",
+    )
     return parser.parse_args()
 
 
@@ -158,6 +165,9 @@ def main():
         start_timestamp, end_timestamp, date_tag = build_date_filter(args)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    exclude_igbp = tuple(
+        dict.fromkeys(code.strip().upper() for code in args.exclude_igbp if code.strip())
+    )
 
     import torch
     import yaml
@@ -200,6 +210,8 @@ def main():
     print(f"DB path: {db_path}")
     if start_timestamp is not None or end_timestamp is not None:
         print(f"ERA5 date filter: {start_timestamp or 'start'} to {end_timestamp or 'end'}")
+    if exclude_igbp:
+        print(f"Excluded IGBP classes: {', '.join(exclude_igbp)}")
 
     model_config = EcoPerceiverConfig(**config["model"])
     relative_pretrained_path = repo_root / "ecoperceiver" / "resnet18_weights.pth"
@@ -222,6 +234,7 @@ def main():
         sql_file=db_path,
         start_timestamp=start_timestamp,
         end_timestamp=end_timestamp,
+        exclude_igbp=exclude_igbp,
     )
     if args.max_samples is None:
         max_samples = len(dataset)

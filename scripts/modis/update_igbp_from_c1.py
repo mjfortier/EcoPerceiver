@@ -8,6 +8,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
+import sys
 import time
 from urllib.parse import quote
 
@@ -18,31 +19,15 @@ from tqdm.auto import tqdm
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+
+from ecoperceiver.constants import IGBP_ACRONYMS_MODIS
+
 DEFAULT_DB_PATH = Path("/home/l/luislara/links/projects/aip-pal/luislara/ep/data/era5.db")
 DEFAULT_C1_PATH = REPO_ROOT / "experiments" / "data" / "raw_modis" / "201801011200C1.tiff"
 DEFAULT_TABLE = "coord_data"
 DEFAULT_BATCH_SIZE = 10_000
 SQLITE_TIMEOUT_SECONDS = 60.0
-
-IGBP_ACRONYMS = {
-    0: "WAT",
-    1: "ENF",
-    2: "EBF",
-    3: "DNF",
-    4: "DBF",
-    5: "MF",
-    6: "CSH",
-    7: "OSH",
-    8: "WSA",
-    9: "SAV",
-    10: "GRA",
-    11: "WET",
-    12: "CRO",
-    13: "URB",
-    14: "CVM",
-    15: "SNO",
-    16: "BSV",
-}
 
 
 @dataclass(frozen=True)
@@ -147,7 +132,7 @@ def load_c1_raster(path: Path) -> RasterGrid:
     if values.ndim != 2:
         raise SystemExit(f"Expected a single-band C1 raster, found shape {values.shape}.")
 
-    unknown_codes = sorted(set(np.unique(values).tolist()) - set(IGBP_ACRONYMS))
+    unknown_codes = sorted(set(np.unique(values).tolist()) - set(IGBP_ACRONYMS_MODIS))
     if unknown_codes:
         raise SystemExit(
             "C1 raster contains unknown IGBP code(s): "
@@ -297,7 +282,7 @@ def plan_updates(
                 for position, code in zip(valid_positions, codes):
                     rowid, _, _, _, old_igbp = batch[position]
                     old_label = "NULL" if old_igbp is None else str(old_igbp)
-                    new_igbp = IGBP_ACRONYMS[int(code)]
+                    new_igbp = IGBP_ACRONYMS_MODIS[int(code)]
                     new_counts[new_igbp] += 1
                     transitions[(old_label, new_igbp)] += 1
 
