@@ -1,5 +1,6 @@
 import argparse
 import csv
+import math
 from datetime import datetime, time
 from pathlib import Path
 from utils import resolve_checkpoint_path, resolve_config_path, resolve_device
@@ -65,6 +66,93 @@ def build_date_filter(args: argparse.Namespace) -> tuple[int | None, int | None,
 def default_output_csv_path(run_path: Path, date_tag: str | None) -> Path:
     filename = "era5_predictions.csv" if date_tag is None else f"era5_predictions_{date_tag}.csv"
     return run_path / "eval" / filename
+
+
+def parse_requested_prediction_targets(values: list[str] | None) -> tuple[str, ...] | None:
+    if values is None:
+        return None
+
+    requested = []
+    for value in values:
+        requested.extend(item.strip() for item in value.split(",") if item.strip())
+
+    requested = list(dict.fromkeys(requested))
+    if not requested:
+        raise ValueError("--prediction-targets requires at least one target when provided.")
+    return tuple(requested)
+
+
+def resolve_prediction_target_indices(
+    prediction_targets: tuple[str, ...] | None,
+    flux_labels,
+) -> tuple[list[int], list[str]]:
+    flux_labels = list(flux_labels)
+    if prediction_targets is None:
+        return list(range(len(flux_labels))), flux_labels
+
+    flux_to_index = {flux: idx for idx, flux in enumerate(flux_labels)}
+    selected_indices = []
+    selected_flux_labels = []
+    invalid = []
+    for prediction_target in prediction_targets:
+        flux = prediction_target.removeprefix("pred_")
+        if flux not in flux_to_index:
+            invalid.append(prediction_target)
+            continue
+        selected_indices.append(flux_to_index[flux])
+        selected_flux_labels.append(flux)
+
+    if invalid:
+        available = ", ".join(f"pred_{flux}" for flux in flux_labels)
+        raise ValueError(
+            f"Unknown --prediction-targets value(s): {', '.join(invalid)}. "
+            f"Available prediction columns: {available}"
+        )
+
+    return selected_indices, selected_flux_labels
+
+
+def normalize_predictor_value(predictor: str, raw_value: float) -> float:
+    from ecoperceiver.constants import DEFAULT_NORM
+
+    norm_config = DEFAULT_NORM[predictor]
+    value_max = norm_config["norm_max"]
+    value_min = norm_config["norm_min"]
+    value_mid = (value_max + value_min) / 2
+    value_range = value_max - value_min
+    if norm_config["cyclic"]:
+        value_range /= 2
+
+    return (raw_value - value_mid) / value_range
+
+
+def gpp_flux_indices(flux_labels) -> list[int]:
+    return [
+        idx
+        for idx, flux in enumerate(flux_labels)
+        if flux == "GPP" or flux.startswith("GPP_")
+    ]
+
+
+def zero_low_solar_gpp_predictions(yhat, batch, flux_labels, normalized_threshold: float):
+    if "SW_IN" not in batch.predictor_columns:
+        raise ValueError("--gpp-solar-threshold requires SW_IN in predictor columns.")
+
+    gpp_indices = gpp_flux_indices(flux_labels)
+    if not gpp_indices:
+        raise ValueError("--gpp-solar-threshold was set, but the model has no GPP output.")
+
+    sw_in_idx = batch.predictor_columns.index("SW_IN")
+    final_sw_in = batch.predictor_values[:, -1, sw_in_idx].to(device=yhat.device)
+    low_solar_mask = final_sw_in < normalized_threshold
+    low_solar_count = int(low_solar_mask.sum().item())
+    if low_solar_count == 0:
+        return yhat, 0
+
+    yhat = yhat.clone()
+    for gpp_idx in gpp_indices:
+        yhat[low_solar_mask, gpp_idx] = 0.0
+    return yhat, low_solar_count
 
 
 def parse_args():
@@ -156,6 +244,27 @@ def parse_args():
         metavar="CODE",
         help="IGBP code(s) to exclude from ERA5 inference.",
     )
+    parser.add_argument(
+        "--prediction-targets",
+        nargs="+",
+        default=None,
+        metavar="TARGET",
+        help=(
+            "Prediction target columns to include in the output CSV. Accepts "
+            "comma-separated or space-separated values, with or without the "
+            "pred_ prefix. Default: all model outputs."
+        ),
+    )
+    parser.add_argument(
+        "--gpp-solar-threshold",
+        type=float,
+        default=None,
+        help=(
+            "If provided, force GPP prediction columns to 0.0 when the final "
+            "raw SW_IN predictor is below this threshold in W m-2. The value "
+            "is converted to the normalized SW_IN units stored in the ERA5 database."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -163,10 +272,19 @@ def main():
     args = parse_args()
     try:
         start_timestamp, end_timestamp, date_tag = build_date_filter(args)
+        requested_prediction_targets = parse_requested_prediction_targets(args.prediction_targets)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     exclude_igbp = tuple(
         dict.fromkeys(code.strip().upper() for code in args.exclude_igbp if code.strip())
+    )
+    force_zero_gpp_low_solar = args.gpp_solar_threshold is not None
+    if force_zero_gpp_low_solar and not math.isfinite(args.gpp_solar_threshold):
+        raise ValueError("--gpp-solar-threshold must be finite.")
+    normalized_gpp_solar_threshold = (
+        normalize_predictor_value("SW_IN", args.gpp_solar_threshold)
+        if force_zero_gpp_low_solar
+        else None
     )
 
     import torch
@@ -199,8 +317,18 @@ def main():
     with config_path.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    try:
+        output_target_indices, output_flux_labels = resolve_prediction_target_indices(
+            requested_prediction_targets,
+            config["model"]["targets"],
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    output_prediction_columns = [f"pred_{flux}" for flux in output_flux_labels]
+
     print("Configuration loaded:")
     print(f"Model targets: {config['model']['targets']}")
+    print(f"Output prediction columns: {', '.join(output_prediction_columns)}")
     print(f"Context length: {config['model']['context_length']}")
     print(f"Latent space dim: {config['model']['latent_space_dim']}")
     print(f"Run path: {run_path}")
@@ -212,6 +340,12 @@ def main():
         print(f"ERA5 date filter: {start_timestamp or 'start'} to {end_timestamp or 'end'}")
     if exclude_igbp:
         print(f"Excluded IGBP classes: {', '.join(exclude_igbp)}")
+    if force_zero_gpp_low_solar:
+        print(
+            "Low-solar GPP override: force GPP* predictions to 0 when "
+            f"raw final SW_IN < {args.gpp_solar_threshold:g} W m-2 "
+            f"(normalized SW_IN < {normalized_gpp_solar_threshold:.6g})"
+        )
 
     model_config = EcoPerceiverConfig(**config["model"])
     relative_pretrained_path = repo_root / "ecoperceiver" / "resnet18_weights.pth"
@@ -276,6 +410,7 @@ def main():
     print("Testing model inference...")
     rows_written = 0
     batches_processed = 0
+    low_solar_gpp_rows = 0
     with output_csv_path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = None
         include_ground_truth = False
@@ -287,12 +422,20 @@ def main():
 
                 res = model(batch)
                 yhat = res.predictions
+                if force_zero_gpp_low_solar:
+                    yhat, low_solar_count = zero_low_solar_gpp_predictions(
+                        yhat,
+                        batch,
+                        res.flux_labels,
+                        normalized_gpp_solar_threshold,
+                    )
+                    low_solar_gpp_rows += low_solar_count
 
                 if writer is None:
-                    fieldnames = ["lat", "lon", "igbp", "timestamp"] + [f"pred_{flux}" for flux in res.flux_labels]
+                    fieldnames = ["lat", "lon", "igbp", "timestamp"] + output_prediction_columns
                     include_ground_truth = res.ground_truth is not None
                     if include_ground_truth:
-                        fieldnames += [f"gt_{flux}" for flux in res.flux_labels]
+                        fieldnames += [f"gt_{flux}" for flux in output_flux_labels]
                     writer = csv.writer(csv_file)
                     writer.writerow(fieldnames)
                     print(f"Pred shape per batch: {yhat.shape}")
@@ -314,15 +457,22 @@ def main():
                         batch.igbp[i],
                         ts,
                     ]
-                    for j, flux in enumerate(res.flux_labels):
+                    for j in output_target_indices:
                         row.append(f"{preds_cpu[i, j].item():.4f}")
-                        if include_ground_truth:
+                    if include_ground_truth:
+                        for j in output_target_indices:
                             row.append(f"{gt_cpu[i, j].item():.4f}")
                     rows.append(row)
                 writer.writerows(rows)
                 rows_written += len(rows)
 
     print(f"Saved predictions for {rows_written} samples across {batches_processed} batches to: {output_csv_path}")
+    if force_zero_gpp_low_solar:
+        print(
+            f"Forced GPP=0 for {low_solar_gpp_rows} samples with "
+            f"raw final SW_IN < {args.gpp_solar_threshold:g} W m-2 "
+            f"(normalized SW_IN < {normalized_gpp_solar_threshold:.6g})"
+        )
 
 
 if __name__ == "__main__":
