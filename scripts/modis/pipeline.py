@@ -21,7 +21,11 @@ except ModuleNotFoundError:
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "pipeline_config.yml"
-DEFAULT_STEPS = ("drop_nighttime", "drop_areas", "rebuild_ids_era5", "transform_modis")
+DEFAULT_STEPS = (
+    "update_igbp_from_c1",
+    "index_era5",
+    "transform_modis",
+)
 
 
 @dataclass(frozen=True)
@@ -35,17 +39,13 @@ STEPS = {
         name="download_modis",
         description="Download raw MODIS GeoTIFFs from Earth Engine.",
     ),
-    "drop_nighttime": PipelineStep(
-        name="drop_nighttime",
-        description="Drop ec_data rows with solar radiation below the daytime threshold.",
+    "update_igbp_from_c1": PipelineStep(
+        name="update_igbp_from_c1",
+        description="Update ERA5 coord_data.igbp from a MODIS C1 land-cover raster.",
     ),
-    "drop_areas": PipelineStep(
-        name="drop_areas",
-        description="Drop ec_data rows inside configured geographic areas.",
-    ),
-    "rebuild_ids_era5": PipelineStep(
-        name="rebuild_ids_era5",
-        description="Rebuild ec_data ids once after all row filters.",
+    "index_era5": PipelineStep(
+        name="index_era5",
+        description="Create persistent ec_data indexes for ERA5 eval and MODIS lookup.",
     ),
     "transform_modis": PipelineStep(
         name="transform_modis",
@@ -148,10 +148,9 @@ def parse_args() -> argparse.Namespace:
 
     pipeline_config = config_section(config, "pipeline")
     download_config = config_section(config, "download_modis")
+    update_igbp_config = config_section(config, "update_igbp_from_c1")
     transform_config = config_section(config, "transform_modis")
-    drop_config = config_section(config, "drop_nighttime")
-    drop_areas_config = config_section(config, "drop_areas")
-    rebuild_ids_config = config_section(config, "rebuild_ids_era5")
+    index_config = config_section(config, "index_era5")
 
     default_steps = config_list(
         pipeline_config.get("steps"),
@@ -165,17 +164,10 @@ def parse_args() -> argparse.Namespace:
         default=[],
         field_name="transform_modis.dates",
     )
-    default_drop_areas = config_list(
-        drop_areas_config.get("areas"),
-        default=[],
-        field_name="drop_areas.areas",
-    )
-
     parser = argparse.ArgumentParser(
         parents=[config_parser],
         description=(
-            "Run selected pieces of the EcoPerceiver ERA5/MODIS pipeline. "
-            "By default, download_modis is not run."
+            "Run selected pieces of the EcoPerceiver ERA5/MODIS pipeline."
         ),
     )
     parser.set_defaults(config_path=resolved_config_path)
@@ -187,6 +179,11 @@ def parse_args() -> argparse.Namespace:
         help=f"Pipeline steps to run, in order. Config default: {' '.join(default_steps)}.",
     )
     parser.add_argument(
+        "--list-steps",
+        action="store_true",
+        help="Print available pipeline steps and exit.",
+    )
+    parser.add_argument(
         "--include-download",
         action=argparse.BooleanOptionalAction,
         default=bool_config(
@@ -195,11 +192,6 @@ def parse_args() -> argparse.Namespace:
             field_name="pipeline.include_download",
         ),
         help="Prepend download_modis to the selected steps if it is not already present.",
-    )
-    parser.add_argument(
-        "--list-steps",
-        action="store_true",
-        help="Print available pipeline steps and exit.",
     )
     parser.add_argument(
         "--dry-run",
@@ -222,20 +214,17 @@ def parse_args() -> argparse.Namespace:
         default=resolve_repo_path(
             pipeline_config.get("db_path", "experiments/data/poc_era5.db")
         ),
-        help="SQLite DB used by transform/filter steps.",
+        help="SQLite DB used by ERA5/MODIS pipeline steps.",
     )
 
     add_download_args(parser, download_config)
+    add_update_igbp_args(parser, update_igbp_config)
     add_transform_args(parser, transform_config)
-    add_drop_nighttime_args(parser, drop_config)
-    add_drop_areas_args(parser, drop_areas_config)
-    add_rebuild_ids_args(parser, rebuild_ids_config)
+    add_index_era5_args(parser, index_config)
     args = parser.parse_args()
 
     if args.modis_dates is None:
         args.modis_dates = default_modis_dates
-    if args.drop_areas is None:
-        args.drop_areas = default_drop_areas
     validate_steps(list(args.steps))
     return args
 
@@ -289,6 +278,52 @@ def add_download_args(
             field_name="download_modis.authenticate",
         ),
         help="Run Earth Engine authentication before downloading.",
+    )
+
+
+def add_update_igbp_args(
+    parser: argparse.ArgumentParser,
+    config: dict[str, Any],
+) -> None:
+    group = parser.add_argument_group("update_igbp_from_c1 options")
+    group.add_argument(
+        "--igbp-c1-path",
+        type=Path,
+        default=resolve_repo_path(
+            config.get("c1_path", "experiments/data/raw_modis/201801011200C1.tiff")
+        ),
+        help="MODIS MCD12C1 GeoTIFF used to update coord_data.igbp.",
+    )
+    group.add_argument(
+        "--igbp-table",
+        default=config.get("table", "coord_data"),
+        help="ERA5 coordinate table containing lat, lon, and igbp columns.",
+    )
+    group.add_argument(
+        "--igbp-only-null",
+        action=argparse.BooleanOptionalAction,
+        default=bool_config(
+            config.get("only_null"),
+            default=False,
+            field_name="update_igbp_from_c1.only_null",
+        ),
+        help="Only update coord_data rows where igbp is NULL.",
+    )
+    group.add_argument(
+        "--igbp-write",
+        action=argparse.BooleanOptionalAction,
+        default=bool_config(
+            config.get("write"),
+            default=True,
+            field_name="update_igbp_from_c1.write",
+        ),
+        help="Apply IGBP updates. Use --no-igbp-write to run the updater read-only.",
+    )
+    group.add_argument(
+        "--igbp-batch-size",
+        type=int,
+        default=config.get("batch_size", 10_000),
+        help="SQLite update batch size for update_igbp_from_c1.",
     )
 
 
@@ -347,164 +382,85 @@ def add_transform_args(
     )
 
 
-def add_drop_nighttime_args(
+def add_index_era5_args(
     parser: argparse.ArgumentParser,
     config: dict[str, Any],
 ) -> None:
-    group = parser.add_argument_group("drop_nighttime options")
+    group = parser.add_argument_group("index_era5 options")
     group.add_argument(
-        "--radiation-column",
-        default=config.get("radiation_column", "SW_IN"),
-        help="Solar radiation column used to detect nighttime.",
-    )
-    group.add_argument(
-        "--threshold-w-m2",
-        type=float,
-        default=config.get("threshold_w_m2", 2.0),
-        help="Daytime threshold in W m-2.",
-    )
-    group.add_argument(
-        "--drop-missing-radiation",
-        action=argparse.BooleanOptionalAction,
-        default=bool_config(
-            config.get("drop_missing_radiation"),
-            default=False,
-            field_name="drop_nighttime.drop_missing_radiation",
-        ),
-        help="Also drop rows with NULL radiation.",
-    )
-    group.add_argument(
-        "--vacuum",
-        action=argparse.BooleanOptionalAction,
-        default=bool_config(
-            config.get("vacuum"),
-            default=False,
-            field_name="drop_nighttime.vacuum",
-        ),
-        help="Run VACUUM after dropping nighttime rows.",
-    )
-    group.add_argument(
-        "--filter-dry-run",
-        action=argparse.BooleanOptionalAction,
-        default=bool_config(
-            config.get("dry_run"),
-            default=False,
-            field_name="drop_nighttime.dry_run",
-        ),
-        help="Run the nighttime filter in dry-run mode even when the pipeline runs.",
-    )
-    group.add_argument(
-        "--nighttime-chunk-size",
-        dest="nighttime_chunk_size",
-        type=int,
-        default=config.get("chunk_size", config.get("delete_chunk_size", 250_000)),
-        help="Number of id values scanned per drop_nighttime rewrite chunk.",
-    )
-    group.add_argument(
-        "--nighttime-delete-chunk-size",
-        dest="nighttime_chunk_size",
-        type=int,
-        help=argparse.SUPPRESS,
-    )
-
-
-def add_drop_areas_args(
-    parser: argparse.ArgumentParser,
-    config: dict[str, Any],
-) -> None:
-    group = parser.add_argument_group("drop_areas options")
-    group.add_argument(
-        "--areas-config",
-        type=Path,
-        default=resolve_repo_path(
-            config.get("areas_config", "scripts/modis/drop_areas_config.yml")
-        ),
-        help="YAML file with geographic area definitions.",
-    )
-    group.add_argument(
-        "--drop-area",
-        dest="drop_areas",
-        action="append",
-        default=None,
-        help=(
-            "Area name to drop. Repeat for multiple areas. "
-            "Default: enabled areas in --areas-config."
-        ),
-    )
-    group.add_argument(
-        "--areas-vacuum",
-        action=argparse.BooleanOptionalAction,
-        default=bool_config(
-            config.get("vacuum"),
-            default=False,
-            field_name="drop_areas.vacuum",
-        ),
-        help="Run VACUUM after dropping configured areas.",
-    )
-    group.add_argument(
-        "--areas-dry-run",
-        action=argparse.BooleanOptionalAction,
-        default=bool_config(
-            config.get("dry_run"),
-            default=False,
-            field_name="drop_areas.dry_run",
-        ),
-        help="Run the area filter in dry-run mode even when the pipeline runs.",
-    )
-    group.add_argument(
-        "--areas-delete-chunk-size",
-        type=int,
-        default=config.get(
-            "delete_chunk_size",
-            config.get("delete_coord_chunk_size", 2_000_000),
-        ),
-        help="Number of ec_data id values scanned per drop_areas delete chunk.",
-    )
-
-
-def add_rebuild_ids_args(
-    parser: argparse.ArgumentParser,
-    config: dict[str, Any],
-) -> None:
-    group = parser.add_argument_group("rebuild_ids_era5 options")
-    group.add_argument(
-        "--rebuild-ids-table",
+        "--era5-index-table",
         default=config.get("table", "ec_data"),
-        help="ERA5 table whose id column should be rebuilt.",
+        help="ERA5 table to index.",
     )
     group.add_argument(
-        "--rebuild-ids-vacuum",
+        "--era5-index-name",
+        default=config.get("index_name", "idx_ec_data_coord_id_timestamp_id"),
+        help="Composite index name used by ERA5 eval.",
+    )
+    group.add_argument(
+        "--era5-index-columns",
+        nargs="+",
+        default=config_list(
+            config.get("columns"),
+            default=["coord_id", "timestamp", "id"],
+            field_name="index_era5.columns",
+        ),
+        help="Columns for the composite ERA5 eval index.",
+    )
+    group.add_argument(
+        "--era5-index-analyze",
         action=argparse.BooleanOptionalAction,
         default=bool_config(
-            config.get("vacuum"),
-            default=False,
-            field_name="rebuild_ids_era5.vacuum",
+            config.get("analyze"),
+            default=True,
+            field_name="index_era5.analyze",
         ),
-        help="Run VACUUM after the final ERA5 id rebuild step.",
+        help="Run ANALYZE after creating the index.",
     )
     group.add_argument(
-        "--rebuild-ids-dry-run",
+        "--era5-index-dry-run",
         action=argparse.BooleanOptionalAction,
         default=bool_config(
             config.get("dry_run"),
             default=False,
-            field_name="rebuild_ids_era5.dry_run",
+            field_name="index_era5.dry_run",
         ),
-        help="Run the final ERA5 id rebuild step in dry-run mode.",
+        help="Run the index_era5 step in dry-run mode.",
     )
     group.add_argument(
-        "--rebuild-ids-copy-chunk-size",
-        type=int,
-        default=config.get("copy_chunk_size", 100_000),
-        help="Number of rows copied per rebuild_ids_era5 chunk.",
+        "--era5-index-temp-dir",
+        type=Path,
+        default=resolve_repo_path(config.get("temp_dir")),
+        help="SQLite temporary sorter directory for the ERA5 index build.",
     )
-
-
-def selected_steps(args: argparse.Namespace) -> list[str]:
-    steps = list(args.steps)
-    if args.include_download and "download_modis" not in steps:
-        steps.insert(0, "download_modis")
-    return steps
+    group.add_argument(
+        "--era5-index-journal-mode",
+        choices=("DELETE", "TRUNCATE", "PERSIST", "WAL"),
+        default=config.get("journal_mode", "DELETE"),
+        help="SQLite journal mode to use while building the ERA5 index.",
+    )
+    group.add_argument(
+        "--era5-index-skip-preflight",
+        action=argparse.BooleanOptionalAction,
+        default=bool_config(
+            config.get("skip_preflight"),
+            default=False,
+            field_name="index_era5.skip_preflight",
+        ),
+        help="Skip disk/page-count estimates before creating the ERA5 index.",
+    )
+    group.add_argument(
+        "--era5-index-progress",
+        choices=("auto", "tqdm", "heartbeat", "none"),
+        default=config.get("progress", "auto"),
+        help="Progress display mode for the ERA5 index step.",
+    )
+    group.add_argument(
+        "--era5-index-threads",
+        type=int,
+        default=config.get("threads", 8),
+        help="SQLite worker threads for the ERA5 index step.",
+    )
 
 
 def print_available_steps(default_steps: list[str]) -> None:
@@ -519,14 +475,12 @@ def print_available_steps(default_steps: list[str]) -> None:
 def command_for_step(step: str, args: argparse.Namespace) -> list[str]:
     if step == "download_modis":
         return download_modis_command(args)
+    if step == "update_igbp_from_c1":
+        return update_igbp_from_c1_command(args)
     if step == "transform_modis":
         return transform_modis_command(args)
-    if step == "drop_nighttime":
-        return drop_nighttime_command(args)
-    if step == "drop_areas":
-        return drop_areas_command(args)
-    if step == "rebuild_ids_era5":
-        return rebuild_ids_era5_command(args)
+    if step == "index_era5":
+        return index_era5_command(args)
     raise ValueError(f"Unsupported pipeline step: {step}")
 
 
@@ -554,6 +508,26 @@ def download_modis_command(args: argparse.Namespace) -> list[str]:
     return command
 
 
+def update_igbp_from_c1_command(args: argparse.Namespace) -> list[str]:
+    command = [
+        args.python,
+        str(REPO_ROOT / "scripts" / "modis" / "update_igbp_from_c1.py"),
+        "--db-path",
+        str(args.db_path),
+        "--c1-path",
+        str(args.igbp_c1_path),
+        "--table",
+        args.igbp_table,
+        "--batch-size",
+        str(args.igbp_batch_size),
+    ]
+    if args.igbp_only_null:
+        command.append("--only-null")
+    if args.igbp_write:
+        command.append("--write")
+    return command
+
+
 def transform_modis_command(args: argparse.Namespace) -> list[str]:
     command = [
         args.python,
@@ -576,63 +550,30 @@ def transform_modis_command(args: argparse.Namespace) -> list[str]:
     return command
 
 
-def drop_nighttime_command(args: argparse.Namespace) -> list[str]:
+def index_era5_command(args: argparse.Namespace) -> list[str]:
     command = [
         args.python,
-        str(REPO_ROOT / "scripts" / "modis" / "drop_nighttime_era5.py"),
-        "--db-path",
-        str(args.db_path),
-        "--radiation-column",
-        args.radiation_column,
-        "--threshold-w-m2",
-        str(args.threshold_w_m2),
-        "--chunk-size",
-        str(args.nighttime_chunk_size),
-    ]
-    if args.drop_missing_radiation:
-        command.append("--drop-missing-radiation")
-    if args.vacuum:
-        command.append("--vacuum")
-    if args.filter_dry_run:
-        command.append("--dry-run")
-    return command
-
-
-def drop_areas_command(args: argparse.Namespace) -> list[str]:
-    command = [
-        args.python,
-        str(REPO_ROOT / "scripts" / "modis" / "drop_areas_era5.py"),
-        "--db-path",
-        str(args.db_path),
-        "--areas-config",
-        str(args.areas_config),
-        "--delete-chunk-size",
-        str(args.areas_delete_chunk_size),
-    ]
-    for area_name in args.drop_areas:
-        command.extend(["--area", area_name])
-    if args.areas_vacuum:
-        command.append("--vacuum")
-    if args.areas_dry_run:
-        command.append("--dry-run")
-    return command
-
-
-def rebuild_ids_era5_command(args: argparse.Namespace) -> list[str]:
-    command = [
-        args.python,
-        str(REPO_ROOT / "scripts" / "modis" / "rebuild_ids_era5.py"),
+        str(REPO_ROOT / "scripts" / "modis" / "index_era5.py"),
         "--db-path",
         str(args.db_path),
         "--table",
-        args.rebuild_ids_table,
-        "--copy-chunk-size",
-        str(args.rebuild_ids_copy_chunk_size),
+        args.era5_index_table,
+        "--index-name",
+        args.era5_index_name,
+        "--columns",
+        *args.era5_index_columns,
     ]
-    if args.rebuild_ids_vacuum:
-        command.append("--vacuum")
-    if args.rebuild_ids_dry_run:
+    if not args.era5_index_analyze:
+        command.append("--no-analyze")
+    if args.era5_index_dry_run:
         command.append("--dry-run")
+    if args.era5_index_temp_dir is not None:
+        command.extend(["--temp-dir", str(args.era5_index_temp_dir)])
+    command.extend(["--journal-mode", args.era5_index_journal_mode])
+    command.extend(["--progress", args.era5_index_progress])
+    command.extend(["--threads", str(args.era5_index_threads)])
+    if args.era5_index_skip_preflight:
+        command.append("--skip-preflight")
     return command
 
 
@@ -658,7 +599,9 @@ def main() -> int:
         print_available_steps(list(args.steps))
         return 0
 
-    steps = selected_steps(args)
+    steps = list(args.steps)
+    if args.include_download and "download_modis" not in steps:
+        steps.insert(0, "download_modis")
     print(f"Config: {args.config_path}")
     print(f"Selected pipeline steps: {' '.join(steps)}")
     for step in steps:

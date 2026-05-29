@@ -79,12 +79,26 @@ class ERA5Dataset(Dataset):
                     "SELECT name FROM sqlite_master WHERE type='table';"
                 ).fetchall()
             }
+            required_tables = {'ec_data', 'coord_data'}
+            missing_tables = sorted(required_tables - tables)
+            if missing_tables:
+                raise RuntimeError(
+                    f'ERA5 sqlite file is missing required table(s) '
+                    f'{", ".join(missing_tables)}: {self.sql_file}'
+                )
             self.has_modis_table = 'modis_data' in tables
             self.has_phenocam_table = 'phenocam_data' in tables
 
-            self.data = self._build_sample_index(conn)
+            (
+                self.data,
+                self.sample_coord_ids,
+                self.sample_timestamps,
+            ) = self._build_sample_index(conn)
 
-    def _build_sample_index(self, conn: sqlite3.Connection) -> np.ndarray:
+    def _build_sample_index(
+        self,
+        conn: sqlite3.Connection,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         filters = []
         params = []
         if self.end_timestamp is not None:
@@ -97,11 +111,13 @@ class ERA5Dataset(Dataset):
             SELECT id, coord_id, timestamp
             FROM ec_data
             {where_sql}
-            ORDER BY coord_id, id;
+            ORDER BY coord_id, timestamp, id;
             """,
             params,
         )
         indexes = []
+        coord_ids = []
+        timestamps = []
         current_coord_id = None
         coord_count = 0
 
@@ -118,9 +134,15 @@ class ERA5Dataset(Dataset):
                 if self.start_timestamp is not None and timestamp < self.start_timestamp:
                     continue
                 if coord_count >= self.config.context_length:
-                    indexes.append(row_id)
+                    indexes.append(int(row_id))
+                    coord_ids.append(int(coord_id))
+                    timestamps.append(int(timestamp))
 
-        return np.asarray(indexes, dtype=np.int32)
+        return (
+            np.asarray(indexes, dtype=np.int64),
+            np.asarray(coord_ids, dtype=np.int64),
+            np.asarray(timestamps, dtype=np.int64),
+        )
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -278,22 +300,41 @@ class ERA5Dataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        top_index = self.data[idx]
-        bottom_index = top_index - self.config.context_length + 1
+        top_index = int(self.data[idx])
+        coord_id = int(self.sample_coord_ids[idx])
+        top_timestamp = int(self.sample_timestamps[idx])
         conn = self._get_connection()
         ec_rows = conn.execute(
             f"""
             SELECT {",".join(self.columns)}
-            FROM ec_data
-            WHERE id >= ? AND id <= ?
-            ORDER BY id;
+            FROM (
+                SELECT {",".join(self.columns)}
+                FROM ec_data
+                WHERE coord_id = ?
+                  AND (
+                    timestamp < ?
+                    OR (timestamp = ? AND id <= ?)
+                  )
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?
+            )
+            ORDER BY timestamp, id;
             """,
-            (int(bottom_index), int(top_index)),
+            (
+                coord_id,
+                top_timestamp,
+                top_timestamp,
+                top_index,
+                self.config.context_length,
+            ),
         ).fetchall()
-        if len(ec_rows) == 0:
-            raise IndexError(f'No ERA5 rows found for index {idx} (id range {bottom_index}-{top_index})')
+        if len(ec_rows) != self.config.context_length:
+            raise IndexError(
+                f'Expected {self.config.context_length} ERA5 rows for index {idx} '
+                f'(coord_id {coord_id}, top id {top_index}, top timestamp {top_timestamp}); '
+                f'found {len(ec_rows)}'
+            )
 
-        coord_id = ec_rows[0][1]
         ec_timestamps = [row[2] for row in ec_rows]
         predictor_array = np.asarray(
             [

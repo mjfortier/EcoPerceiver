@@ -61,7 +61,6 @@ MODIS_FILE_RE = re.compile(r"^(?P<timestamp>\d{12})(?P<product>A2|A4)\.tiff$")
 DEFAULT_HEAD_ELEMENTS = 24
 GRID_KEY_SCALE = 4
 COORD_ID_UNIQUE_INDEX = "idx_coord_data_coord_id"
-EC_COORD_ID_INDEX = "idx_ec_data_coord_id"
 SQLITE_HEARTBEAT_SECONDS = 15.0
 SQLITE_PROGRESS_OPCODES = 100_000
 
@@ -350,17 +349,12 @@ def load_coord_lookup(
 ) -> dict[int, dict[int, int]]:
     if active_ec_coords_only:
         if not index_has_leading_column(conn, table="ec_data", column="coord_id"):
-            print(
-                "Creating ec_data(coord_id) index for active MODIS coord lookup...",
-                flush=True,
+            raise RuntimeError(
+                "`--active-ec-coords-only` requires an ec_data index whose first "
+                "column is coord_id. Run `scripts/modis/index_era5.py` first to "
+                "create idx_ec_data_coord_id_timestamp_id, or pass "
+                "`--no-active-ec-coords-only`."
             )
-            with sqlite_heartbeat(conn, "Creating ec_data(coord_id) index"):
-                conn.execute(
-                    f"CREATE INDEX IF NOT EXISTS {quote_identifier(EC_COORD_ID_INDEX)} "
-                    "ON ec_data(coord_id)"
-                )
-            conn.commit()
-            print("Created ec_data(coord_id) index.", flush=True)
 
         with sqlite_heartbeat(conn, "Loading active MODIS coord lookup"):
             rows = conn.execute(

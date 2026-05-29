@@ -1,8 +1,7 @@
 pipeline:
   steps:
-    - drop_nighttime
-    # - drop_areas
-    - rebuild_ids_era5
+    - update_igbp_from_c1
+    - index_era5
     - transform_modis
   include_download: false
   dry_run: false
@@ -17,25 +16,26 @@ download_modis:
   overwrite: false
   authenticate: false
 
-drop_nighttime:
-  radiation_column: SW_IN
-  threshold_w_m2: 2.0
-  drop_missing_radiation: false
-  chunk_size: 1000000
-  vacuum: false
-  dry_run: false
+update_igbp_from_c1:
+  c1_path: experiments/data/raw_modis/201701011200C1.tiff
+  table: coord_data
+  only_null: false
+  write: true
+  batch_size: 10000
 
-drop_areas:
-  areas_config: scripts/modis/drop_areas_config.yml
-  areas: []
-  delete_chunk_size: 1000000
-  vacuum: false
-  dry_run: false
-
-rebuild_ids_era5:
+index_era5:
   table: ec_data
-  copy_chunk_size: 100000
-  vacuum: false
+  index_name: idx_ec_data_coord_id_timestamp_id
+  columns:
+    - coord_id
+    - timestamp
+    - id
+  temp_dir: /project/6100839/luislara/ep/data/sqlite-tmp
+  journal_mode: DELETE
+  skip_preflight: false
+  progress: auto
+  threads: 8
+  analyze: true
   dry_run: false
 
 transform_modis:
