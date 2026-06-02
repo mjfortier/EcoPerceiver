@@ -3,9 +3,9 @@
 #SBATCH --gres=gpu:h100:4
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=32
-#SBATCH --time=24:00:00
-#SBATCH --output=/scratch/l/luislara/EcoPerceiver/logs/eval_era5.out
-#SBATCH --error=/scratch/l/luislara/EcoPerceiver/logs/eval_era5.error
+#SBATCH --time=1:00:00
+#SBATCH --output=/scratch/l/luislara/EcoPerceiver/logs/eval_era5_single.out
+#SBATCH --error=/scratch/l/luislara/EcoPerceiver/logs/eval_era5_single.error
 #SBATCH --open-mode=truncate
 #SBATCH --job-name=eval-era5
 #SBATCH --account=aip-pal
@@ -17,17 +17,17 @@ cd ~/links/scratch/EcoPerceiver
 
 export PYTHONUNBUFFERED=1
 echo "[$(date)] Starting eval-era5 job ${SLURM_JOB_ID:-local} on ${SLURM_JOB_NODELIST:-local}"
-echo "stdout: /scratch/l/luislara/EcoPerceiver/logs/eval_era5.out"
-echo "stderr: /scratch/l/luislara/EcoPerceiver/logs/eval_era5.error"
+echo "stdout: /scratch/l/luislara/EcoPerceiver/logs/eval_era5_single.out"
+echo "stderr: /scratch/l/luislara/EcoPerceiver/logs/eval_era5_single.error"
 
 RUN_PATH="experiments/runs/final_v2_3e-06_ws_l128_f12_e32_c32_o0.3_wcswcswcswcsssss_CC/seed_0"
 DB_PATH="/home/l/luislara/links/projects/aip-pal/luislara/ep/data/era5.db"
 INITIAL_DATE="2017-06-01"
 FINAL_DATE="2017-06-30"
 DATE_TAG="${INITIAL_DATE//-/}_to_${FINAL_DATE//-/}"
-OUTPUT_CSV="$RUN_PATH/eval/era5_predictions_${DATE_TAG}.csv"
+OUTPUT_CSV="$RUN_PATH/eval/era5_predictions_${DATE_TAG}_single.csv"
 IGBP_EXCLUDED=(WAT SNO BSV URB CRO CVM)
-PREDICTION_TARGETS=(pred_NEE pred_GPP_DT pred_RECO_DT pred_FCH4 pred_LE)
+PREDICTION_TARGETS=(pred_GPP_DT pred_RECO_DT pred_FCH4 pred_LE)
 
 echo "Output CSV: $OUTPUT_CSV"
 
