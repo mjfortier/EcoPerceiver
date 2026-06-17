@@ -351,7 +351,7 @@ def load_coord_lookup(
         if not index_has_leading_column(conn, table="ec_data", column="coord_id"):
             raise RuntimeError(
                 "`--active-ec-coords-only` requires an ec_data index whose first "
-                "column is coord_id. Run `scripts/modis/index_era5.py` first to "
+                "column is coord_id. Run `era5_download/modis/index_era5.py` first to "
                 "create idx_ec_data_coord_id_timestamp_id, or pass "
                 "`--no-active-ec-coords-only`."
             )

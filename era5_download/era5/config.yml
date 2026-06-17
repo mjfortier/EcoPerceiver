@@ -1,0 +1,80 @@
+years:
+  - 2016
+  - 2017
+
+paths:
+  output_dir: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017
+  db_path: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017/era5_2016_2017.db
+  netcdf_dir: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017/era5_data
+  zip_dir: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017/era5_zip
+
+download:
+  enabled: true
+  dataset: reanalysis-era5-single-levels
+  product_type: reanalysis
+  data_format: netcdf
+  download_format: zip
+  # ERA5/CDS area order is north, west, south, east.
+  bbox: [90, -180, -90, 180]
+  # CarbonCast forces daily groups for large areas. Latitude bands keep each
+  # request smaller for global exports.
+  temporal_chunk: daily
+  latitude_band_degrees: 30
+  overwrite: false
+  variables:
+    - 10m_u_component_of_wind
+    - 10m_v_component_of_wind
+    - 2m_dewpoint_temperature
+    - 2m_temperature
+    - surface_pressure
+    - total_precipitation
+    - mean_surface_downward_long_wave_radiation_flux
+    - mean_surface_downward_short_wave_radiation_flux
+    - mean_surface_downward_short_wave_radiation_flux_clear_sky
+    - mean_surface_net_long_wave_radiation_flux
+    - mean_surface_latent_heat_flux
+    - mean_surface_sensible_heat_flux
+    - soil_temperature_level_1
+    - soil_temperature_level_2
+    - soil_temperature_level_3
+    - volumetric_soil_water_layer_1
+    - volumetric_soil_water_layer_2
+    - volumetric_soil_water_layer_3
+    - forecast_albedo
+    - friction_velocity
+    - geopotential
+
+processing:
+  recreate_db: true
+  batch_size: 50000
+  xarray_engine: h5netcdf
+  create_index: true
+  sqlite_temp_dir: null
+  sqlite_threads: 8
+
+  timezone:
+    enabled: true
+    # "local" stores wall-clock timestamps per coordinate. Half-hour offsets
+    # produce timestamps such as YYYYMMDDHH3000.
+    timestamp_policy: local
+    # Use timezonefinder/IANA zones when installed. If a coordinate has no
+    # zone, fall back to longitude-based quarter-hour offsets.
+    method: timezonefinder
+    require_timezonefinder: true
+    fallback: longitude_quarter_hour
+    local_window:
+      enabled: true
+      start: "2016-01-01 00:00:00"
+      end: "2017-12-31 23:59:59"
+
+  land_sea_mask:
+    enabled: true
+    path: experiments/data/lsm.nc
+    threshold: 0.5
+    include_land_neighbors: true
+    allow_missing: false
+
+  igbp:
+    enabled: true
+    raster_path: experiments/data/raw_modis/201701011200C1.tiff
+    allow_missing: false

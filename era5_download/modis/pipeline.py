@@ -487,7 +487,7 @@ def command_for_step(step: str, args: argparse.Namespace) -> list[str]:
 def download_modis_command(args: argparse.Namespace) -> list[str]:
     command = [
         args.python,
-        str(REPO_ROOT / "scripts" / "modis" / "download_modis.py"),
+        str(SCRIPT_DIR / "download_modis.py"),
     ]
     if args.download_start_date is not None:
         command.append(str(args.download_start_date))
@@ -511,7 +511,7 @@ def download_modis_command(args: argparse.Namespace) -> list[str]:
 def update_igbp_from_c1_command(args: argparse.Namespace) -> list[str]:
     command = [
         args.python,
-        str(REPO_ROOT / "scripts" / "modis" / "update_igbp_from_c1.py"),
+        str(SCRIPT_DIR / "update_igbp_from_c1.py"),
         "--db-path",
         str(args.db_path),
         "--c1-path",
@@ -531,7 +531,7 @@ def update_igbp_from_c1_command(args: argparse.Namespace) -> list[str]:
 def transform_modis_command(args: argparse.Namespace) -> list[str]:
     command = [
         args.python,
-        str(REPO_ROOT / "scripts" / "modis" / "transform_modis.py"),
+        str(SCRIPT_DIR / "transform_modis.py"),
         "--input-dir",
         str(args.modis_input_dir),
         "--db-path",
@@ -553,7 +553,7 @@ def transform_modis_command(args: argparse.Namespace) -> list[str]:
 def index_era5_command(args: argparse.Namespace) -> list[str]:
     command = [
         args.python,
-        str(REPO_ROOT / "scripts" / "modis" / "index_era5.py"),
+        str(SCRIPT_DIR / "index_era5.py"),
         "--db-path",
         str(args.db_path),
         "--table",
