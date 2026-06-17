@@ -15,6 +15,12 @@ IGBP_ACRONYMS = {
     13: None, 14: 'CVM', 15: 'SNO', 16: None,
 }
 
+IGBP_ACRONYMS_MODIS = {
+    0: 'WAT', 1: 'ENF', 2: 'EBF', 3: 'DNF', 4: 'DBF', 5: 'MF', 6: 'CSH',
+    7: 'OSH', 8: 'WSA', 9: 'SAV', 10: 'GRA', 11: 'WET', 12: 'CRO',
+    13: 'URB', 14: 'CVM', 15: 'SNO', 16: 'BSV',
+}
+
 DEFAULT_NORM = {
     'DOY': {'cyclic': True, 'norm_max': 366.0, 'norm_min': 0.0},
     'TOD': {'cyclic': True, 'norm_max': 24.0, 'norm_min': 0.0},
