@@ -173,5 +173,6 @@ OLD_*/
 logs/
 scripts/modis/logs/
 scripts/run.sh
+scripts/run_era5.sh
 
 era5_predictions.csv
