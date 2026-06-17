@@ -8,6 +8,7 @@ from torch.utils.data import Dataset
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
+from urllib.parse import quote
 from ecoperceiver.dataset import EcoPerceiverLoaderConfig
 
 
@@ -76,7 +77,7 @@ class ERA5Dataset(Dataset):
             raise FileNotFoundError(f'ERA5 sqlite file not found: {self.sql_file}')
 
         print('Indexing coordinates...')
-        with sqlite3.connect(self.sql_file) as conn:
+        with self._connect_sqlite() as conn:
             tables = {
                 row[0]
                 for row in conn.execute(
@@ -98,6 +99,22 @@ class ERA5Dataset(Dataset):
                 self.sample_coord_ids,
                 self.sample_timestamps,
             ) = self._build_sample_index(conn)
+
+    def _connect_sqlite(self) -> sqlite3.Connection:
+        immutable = os.environ.get("ECOPERCEIVER_SQLITE_IMMUTABLE", "1") != "0"
+        if immutable:
+            db_uri = f"file:{quote(str(self.sql_file), safe='/')}?mode=ro&immutable=1"
+            conn = sqlite3.connect(db_uri, timeout=60, uri=True)
+        else:
+            conn = sqlite3.connect(self.sql_file, timeout=60)
+
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute("PRAGMA temp_store = MEMORY")
+        cache_kib = int(os.environ.get("ECOPERCEIVER_SQLITE_CACHE_KIB", "65536"))
+        mmap_size = int(os.environ.get("ECOPERCEIVER_SQLITE_MMAP_SIZE", "268435456"))
+        conn.execute(f"PRAGMA cache_size = {-cache_kib}")
+        conn.execute(f"PRAGMA mmap_size = {mmap_size}")
+        return conn
 
     def _build_sample_index(
         self,
@@ -201,7 +218,7 @@ class ERA5Dataset(Dataset):
         self._ensure_worker_state()
         if self._conn is None or self._conn_pid != self._worker_pid:
             self._close_connection()
-            self._conn = sqlite3.connect(self.sql_file)
+            self._conn = self._connect_sqlite()
             self._conn_pid = self._worker_pid
         return self._conn
 

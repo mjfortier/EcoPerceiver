@@ -15,6 +15,31 @@ from test_era5 import (
 )
 from utils import resolve_checkpoint_path, resolve_config_path
 
+INTERNAL_ORDER_COLUMN = "__sample_order"
+
+
+class IndexedDataset:
+    def __init__(self, dataset, sample_start: int):
+        self.dataset = dataset
+        self.sample_start = sample_start
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        return self.sample_start + idx, self.dataset[idx]
+
+
+class IndexedERA5Collate:
+    def __init__(self, base_collate_fn):
+        self.base_collate_fn = base_collate_fn
+
+    def __call__(self, batch):
+        sample_indices, samples = zip(*batch)
+        era5_batch = self.base_collate_fn(samples)
+        era5_batch.sample_indices = tuple(int(index) for index in sample_indices)
+        return era5_batch
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -123,6 +148,14 @@ def parse_args():
         help="Number of batches prefetched by each dataloader worker.",
     )
     parser.add_argument(
+        "--dataloader-out-of-order",
+        action="store_true",
+        help=(
+            "Allow DataLoader workers to return ready batches out of order. This avoids "
+            "head-of-line blocking when one worker is repeatedly slower than the others."
+        ),
+    )
+    parser.add_argument(
         "--exclude-igbp",
         nargs="+",
         default=(),
@@ -150,12 +183,24 @@ def parse_args():
             "is converted to the normalized SW_IN units stored in the ERA5 database."
         ),
     )
+    parser.add_argument(
+        "--distributed-timeout-minutes",
+        type=int,
+        default=120,
+        help=(
+            "Timeout for distributed collectives. Long ERA5 shard imbalance can make "
+            "early ranks wait at final synchronization points."
+        ),
+    )
     return parser.parse_args()
 
 
-def init_distributed():
+def init_distributed(timeout_minutes: int):
     import torch
     import torch.distributed as dist
+
+    if timeout_minutes <= 0:
+        raise ValueError("--distributed-timeout-minutes must be a positive integer.")
 
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -179,17 +224,20 @@ def init_distributed():
         dist.init_process_group(
             backend=backend,
             init_method="env://",
-            timeout=timedelta(minutes=30),
+            timeout=timedelta(minutes=timeout_minutes),
         )
 
     return distributed, rank, local_rank, world_size, device
 
 
-def barrier(distributed: bool):
+def barrier(distributed: bool, device=None):
     if distributed:
         import torch.distributed as dist
 
-        dist.barrier()
+        if device is not None and device.type == "cuda":
+            dist.barrier(device_ids=[device.index])
+        else:
+            dist.barrier()
 
 
 def default_output_csv_path(run_path: Path, date_tag: str | None) -> Path:
@@ -302,36 +350,24 @@ def build_rank_limited_era5_dataset_class(base_dataset_class, np_module):
     return RankLimitedERA5Dataset
 
 
-def prepare_shard_dir(shard_dir: Path, *, rank: int, distributed: bool):
+def prepare_shard_dir(shard_dir: Path, *, rank: int, distributed: bool, device):
     if rank == 0:
         if shard_dir.exists():
             shutil.rmtree(shard_dir)
         shard_dir.mkdir(parents=True, exist_ok=True)
-    barrier(distributed)
+    barrier(distributed, device)
 
 
 def merge_csv_shards(shard_paths: list[Path], output_csv_path: Path):
-    output_tmp = output_csv_path.with_suffix(output_csv_path.suffix + ".tmp")
-    header_written = False
-    expected_header = None
+    from merge_era5_shards import merge_csv_shards as merge_post_csv_shards
 
-    with output_tmp.open("wb") as out_file:
-        for shard_path in shard_paths:
-            with shard_path.open("rb") as shard_file:
-                header = shard_file.readline()
-                if not header:
-                    continue
-                if expected_header is None:
-                    expected_header = header
-                elif header != expected_header:
-                    raise RuntimeError(f"CSV header mismatch in shard {shard_path}")
-
-                if not header_written:
-                    out_file.write(header)
-                    header_written = True
-                shutil.copyfileobj(shard_file, out_file, length=1024 * 1024)
-
-    output_tmp.replace(output_csv_path)
+    merge_post_csv_shards(
+        shard_paths,
+        output_csv_path,
+        prediction_targets=None,
+        sort_output=True,
+        sort_tmp_dir=None,
+    )
 
 
 def move_batch_to_device(batch, device):
@@ -349,12 +385,16 @@ def move_batch_to_device(batch, device):
 def iter_prediction_rows(batch, preds_cpu, aux_cpu, output_target_indices):
     lat_idx = batch.aux_columns.index("lat") if "lat" in batch.aux_columns else None
     lon_idx = batch.aux_columns.index("lon") if "lon" in batch.aux_columns else None
+    sample_indices = getattr(batch, "sample_indices", None)
+    if sample_indices is None:
+        raise RuntimeError("ERA5 batch is missing sample_indices required for stable shard ordering.")
 
     for i in range(preds_cpu.shape[0]):
         ts = batch.timestamps[i][-1] if len(batch.timestamps[i]) > 0 else ""
         lat_val = float(aux_cpu[i, lat_idx].item() * 180.0) if lat_idx is not None else float("nan")
         lon_val = float(aux_cpu[i, lon_idx].item() * 180.0) if lon_idx is not None else float("nan")
         row = [
+            str(sample_indices[i]),
             f"{lat_val:.2f}",
             f"{lon_val:.2f}",
             batch.igbp[i],
@@ -367,7 +407,9 @@ def iter_prediction_rows(batch, preds_cpu, aux_cpu, output_target_indices):
 
 def main():
     args = parse_args()
-    distributed, rank, local_rank, world_size, device = init_distributed()
+    distributed, rank, local_rank, world_size, device = init_distributed(
+        args.distributed_timeout_minutes
+    )
     if args.max_samples is not None and args.max_samples <= 0:
         raise ValueError("--max-samples must be a positive integer when provided.")
 
@@ -424,7 +466,7 @@ def main():
 
     if rank == 0:
         output_csv_path.parent.mkdir(parents=True, exist_ok=True)
-    prepare_shard_dir(shard_dir, rank=rank, distributed=distributed)
+    prepare_shard_dir(shard_dir, rank=rank, distributed=distributed, device=device)
 
     with config_path.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
@@ -523,28 +565,34 @@ def main():
     if args.prefetch_factor <= 0:
         raise ValueError("--prefetch-factor must be >= 1.")
     dataloader_batch_size = args.batch_size if args.batch_size is not None else config["dataloader"]["batch_size"]
+    dataloader_in_order = not args.dataloader_out_of_order
+    indexed_rank_dataset = IndexedDataset(rank_dataset, sample_start=rank_start)
     dataloader_kwargs = dict(
-        dataset=rank_dataset,
+        dataset=indexed_rank_dataset,
         batch_size=dataloader_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=config["dataloader"]["pin_memory"],
-        collate_fn=dataset.collate_fn,
+        collate_fn=IndexedERA5Collate(dataset.collate_fn),
     )
     if args.num_workers > 0:
         dataloader_kwargs["persistent_workers"] = True
         dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
+        dataloader_kwargs["in_order"] = dataloader_in_order
     dataloader = DataLoader(**dataloader_kwargs)
 
     print(
         f"[rank {rank}] Dataset samples: indexed_total={total_indexed_samples} requested={max_samples} "
         f"rank_range=[{rank_start}, {rank_end}) rank_samples={len(rank_dataset)} "
-        f"batch_size={dataloader_batch_size} num_workers={args.num_workers}",
+        f"batch_size={dataloader_batch_size} num_workers={args.num_workers} "
+        f"prefetch_factor={args.prefetch_factor if args.num_workers > 0 else 'n/a'} "
+        f"in_order={dataloader_in_order if args.num_workers > 0 else 'n/a'} "
+        f"shard_order_key={INTERNAL_ORDER_COLUMN}",
         flush=True,
     )
 
     shard_path = shard_dir / f"rank_{rank:05d}.csv"
-    fieldnames = ["lat", "lon", "igbp", "timestamp"] + output_prediction_columns
+    fieldnames = [INTERNAL_ORDER_COLUMN, "lat", "lon", "igbp", "timestamp"] + output_prediction_columns
     rows_written = 0
     batches_processed = 0
     low_solar_gpp_rows = 0
@@ -585,6 +633,19 @@ def main():
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
+    print(
+        f"[rank {rank}] Wrote {rows_written} rows across {batches_processed} batches to {shard_path}",
+        flush=True,
+    )
+
+    if args.skip_merge:
+        if rank == 0:
+            print(f"Skipped final merge. Rank shards are written under: {shard_dir}")
+            print(f"Merge later to: {output_csv_path}")
+        if distributed:
+            dist.destroy_process_group()
+        return
+
     stats_device = device if device.type == "cuda" else torch.device("cpu")
     stats = torch.tensor(
         [rows_written, batches_processed, low_solar_gpp_rows],
@@ -599,26 +660,14 @@ def main():
         int(stats[2].item()),
     )
 
-    print(
-        f"[rank {rank}] Wrote {rows_written} rows across {batches_processed} batches to {shard_path}",
-        flush=True,
-    )
-
-    barrier(distributed)
+    barrier(distributed, device)
     if rank == 0:
         shard_paths = [shard_dir / f"rank_{shard_rank:05d}.csv" for shard_rank in range(world_size)]
-        if args.skip_merge:
-            print(
-                f"Skipped final merge. Wrote {total_rows_written} shard rows across "
-                f"{total_batches_processed} batches in: {shard_dir}"
-            )
-            print(f"Merge later to: {output_csv_path}")
-        else:
-            merge_csv_shards(shard_paths, output_csv_path)
-            print(
-                f"Saved predictions for {total_rows_written} samples across "
-                f"{total_batches_processed} batches to: {output_csv_path}"
-            )
+        merge_csv_shards(shard_paths, output_csv_path)
+        print(
+            f"Saved predictions for {total_rows_written} samples across "
+            f"{total_batches_processed} batches to: {output_csv_path}"
+        )
         if force_zero_gpp_low_solar:
             print(
                 f"Forced GPP=0 for {total_low_solar_gpp_rows} samples with "
@@ -628,7 +677,7 @@ def main():
         if not args.skip_merge and not args.keep_shards:
             shutil.rmtree(shard_dir)
 
-    barrier(distributed)
+    barrier(distributed, device)
     if distributed:
         dist.destroy_process_group()
 
