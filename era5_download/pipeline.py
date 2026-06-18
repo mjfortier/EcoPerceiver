@@ -220,6 +220,12 @@ def parse_args() -> argparse.Namespace:
         help="Limit ERA5 request/group count for smoke tests.",
     )
     parser.add_argument(
+        "--era5-max-workers",
+        type=int,
+        default=None,
+        help="Override download.max_workers for concurrent ERA5 CDS downloads.",
+    )
+    parser.add_argument(
         "--overwrite-era5-downloads",
         action="store_true",
         help="Overwrite existing downloaded ERA5 chunks.",
@@ -237,6 +243,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.modis_dates is None:
         args.modis_dates = default_modis_dates
+    if args.era5_max_workers is not None and args.era5_max_workers < 1:
+        parser.error("--era5-max-workers must be at least 1.")
     validate_steps(list(args.steps))
     return args
 
@@ -433,6 +441,8 @@ def download_era5_command(args: argparse.Namespace) -> list[str]:
     ]
     if args.limit_era5_groups is not None:
         command.extend(["--limit-groups", str(args.limit_era5_groups)])
+    if args.era5_max_workers is not None:
+        command.extend(["--max-workers", str(args.era5_max_workers)])
     if args.overwrite_era5_downloads:
         command.append("--overwrite-downloads")
     return command

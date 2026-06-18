@@ -27,9 +27,8 @@ download:
   download_format: zip
   # ERA5/CDS area order is north, west, south, east.
   bbox: [90, -180, -90, 180]
-  # CarbonCast forces daily groups for large areas. Latitude bands keep each
-  # request smaller for global exports.
-  temporal_chunk: daily
+  temporal_chunk: monthly
+  max_workers: 4
   latitude_band_degrees: 30
   overwrite: false
   variables:

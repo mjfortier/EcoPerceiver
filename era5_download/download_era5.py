@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import calendar
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
@@ -24,6 +25,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import sys
+import threading
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import zipfile
@@ -383,10 +385,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Limit request/group count for smoke tests.",
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Override download.max_workers for concurrent CDS downloads.",
+    )
     args = parser.parse_args()
 
     if args.download_only and args.process_only:
         parser.error("--download-only and --process-only are mutually exclusive.")
+    if args.max_workers is not None and args.max_workers < 1:
+        parser.error("--max-workers must be at least 1.")
     return args
 
 
@@ -587,6 +597,20 @@ def extract_zip(zip_path: Path, output_dir: Path) -> None:
         archive.extractall(output_dir)
 
 
+def configured_download_workers(config: dict[str, Any], args: argparse.Namespace) -> int:
+    download_config = section(config, "download")
+    value = args.max_workers
+    if value is None:
+        value = download_config.get("max_workers", 1)
+    try:
+        workers = int(value)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("download.max_workers must be an integer >= 1.") from exc
+    if workers < 1:
+        raise SystemExit("download.max_workers must be an integer >= 1.")
+    return workers
+
+
 def download_groups(config: dict[str, Any], args: argparse.Namespace) -> None:
     paths = section(config, "paths")
     download_config = section(config, "download")
@@ -601,19 +625,20 @@ def download_groups(config: dict[str, Any], args: argparse.Namespace) -> None:
     if args.limit_groups is not None:
         groups = groups[: args.limit_groups]
     overwrite = bool(download_config.get("overwrite", False) or args.overwrite_downloads)
+    max_workers = configured_download_workers(config, args)
 
     print(f"Planned ERA5 CDS request groups: {len(groups)}")
     for index, group in enumerate(groups[:5], start=1):
         print(f"  {index:>3}: {group.stem} area={group.area}")
     if len(groups) > 5:
         print(f"  ... {len(groups) - 5} more")
+    print(f"ERA5 CDS download workers: {max_workers}")
     if args.dry_run:
         return
 
     ensure_dependencies("cdsapi")
     zip_dir.mkdir(parents=True, exist_ok=True)
     netcdf_dir.mkdir(parents=True, exist_ok=True)
-    client = cdsapi.Client(wait_until_complete=True, delete=False)
     dataset = download_config.get("dataset", "reanalysis-era5-single-levels")
     progress = (
         tqdm(
@@ -627,46 +652,103 @@ def download_groups(config: dict[str, Any], args: argparse.Namespace) -> None:
     )
     completed = 0
     skipped = 0
+    pending: list[RequestGroup] = []
+    log_lock = threading.Lock()
+    thread_local = threading.local()
 
     def log(message: str) -> None:
+        with log_lock:
+            if progress is not None:
+                progress.write(message)
+            else:
+                print(message)
+
+    def update_progress() -> None:
         if progress is not None:
-            progress.write(message)
-        else:
-            print(message)
+            progress.set_postfix(done=completed, skipped=skipped, refresh=False)
+
+    def get_client():
+        client = getattr(thread_local, "client", None)
+        if client is None:
+            client = cdsapi.Client(wait_until_complete=True, delete=False)
+            thread_local.client = client
+        return client
+
+    def download_one(group: RequestGroup) -> None:
+        client = get_client()
+        group_dir = netcdf_dir / group.stem
+        sentinel = group_dir / ".complete"
+        zip_path = zip_dir / f"{group.stem}.zip"
+        if overwrite and group_dir.exists():
+            shutil.rmtree(group_dir)
+        if overwrite and zip_path.exists():
+            zip_path.unlink()
+
+        payload = cds_request_payload(config, group)
+        log(f"[request] {group.stem}")
+        result = client.retrieve(dataset, payload)
+        log(f"[download] {zip_path}")
+        result.download(str(zip_path))
+        log(f"[extract] {group_dir}")
+        extract_zip(zip_path, group_dir)
+        sentinel.write_text("complete\n", encoding="utf-8")
+        zip_path.unlink(missing_ok=True)
 
     try:
         for group in groups:
-            if progress is not None:
-                progress.set_postfix_str(group.stem, refresh=False)
-
             group_dir = netcdf_dir / group.stem
             sentinel = group_dir / ".complete"
-            zip_path = zip_dir / f"{group.stem}.zip"
             if sentinel.exists() and not overwrite:
                 skipped += 1
                 log(f"[skip] {group.stem}")
                 if progress is not None:
                     progress.update(1)
-                    progress.set_postfix(done=completed, skipped=skipped, refresh=False)
-                continue
-            if overwrite and group_dir.exists():
-                shutil.rmtree(group_dir)
-            if overwrite and zip_path.exists():
-                zip_path.unlink()
+                update_progress()
+            else:
+                pending.append(group)
 
-            payload = cds_request_payload(config, group)
-            log(f"[request] {group.stem}")
-            result = client.retrieve(dataset, payload)
-            log(f"[download] {zip_path}")
-            result.download(str(zip_path))
-            log(f"[extract] {group_dir}")
-            extract_zip(zip_path, group_dir)
-            sentinel.write_text("complete\n", encoding="utf-8")
-            zip_path.unlink(missing_ok=True)
-            completed += 1
-            if progress is not None:
-                progress.update(1)
-                progress.set_postfix(done=completed, skipped=skipped, refresh=False)
+        if not pending:
+            return
+
+        effective_workers = min(max_workers, len(pending))
+        if effective_workers == 1:
+            for group in pending:
+                if progress is not None:
+                    progress.set_postfix_str(group.stem, refresh=False)
+                download_one(group)
+                completed += 1
+                if progress is not None:
+                    progress.update(1)
+                update_progress()
+            return
+
+        pending_iter = iter(pending)
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            future_to_group = {}
+            for _ in range(effective_workers):
+                group = next(pending_iter, None)
+                if group is None:
+                    break
+                future_to_group[executor.submit(download_one, group)] = group
+
+            while future_to_group:
+                for future in as_completed(future_to_group):
+                    group = future_to_group.pop(future)
+                    if progress is not None:
+                        progress.set_postfix_str(group.stem, refresh=False)
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        raise RuntimeError(f"ERA5 download failed for {group.stem}") from exc
+                    completed += 1
+                    if progress is not None:
+                        progress.update(1)
+                    update_progress()
+
+                    next_group = next(pending_iter, None)
+                    if next_group is not None:
+                        future_to_group[executor.submit(download_one, next_group)] = next_group
+                    break
     finally:
         if progress is not None:
             progress.close()
