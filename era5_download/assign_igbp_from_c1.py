@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Update coord_data.igbp from a MODIS MCD12C1 GeoTIFF."""
+"""Assign coord_data.igbp from a MODIS MCD12C1 GeoTIFF."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from rasterio.transform import rowcol
 from tqdm.auto import tqdm
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from ecoperceiver.constants import IGBP_ACRONYMS_MODIS
@@ -45,7 +45,7 @@ class RasterGrid:
 
 
 @dataclass(frozen=True)
-class PlannedUpdate:
+class PlannedAssignment:
     rowid: int
     new_igbp: str
 
@@ -53,7 +53,7 @@ class PlannedUpdate:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Sample MODIS MCD12C1 Majority_Land_Cover_Type_1 values and update "
+            "Sample MODIS MCD12C1 Majority_Land_Cover_Type_1 values and assign "
             "coord_data.igbp labels in an ERA5 SQLite database. The default is "
             "a dry run; pass --write to modify the database."
         )
@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
         "--db-path",
         type=Path,
         default=DEFAULT_DB_PATH,
-        help=f"SQLite database to update. Default: {DEFAULT_DB_PATH}",
+        help=f"SQLite database to modify. Default: {DEFAULT_DB_PATH}",
     )
     parser.add_argument(
         "--c1-path",
@@ -73,23 +73,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--table",
         default=DEFAULT_TABLE,
-        help=f"Coordinate table to update. Default: {DEFAULT_TABLE}",
+        help=f"Coordinate table to assign. Default: {DEFAULT_TABLE}",
     )
     parser.add_argument(
         "--only-null",
         action="store_true",
-        help="Only update rows where coord_data.igbp is NULL.",
+        help="Only assign rows where coord_data.igbp is NULL.",
     )
     parser.add_argument(
         "--write",
         action="store_true",
-        help="Apply the planned updates. Without this flag, only a dry run is printed.",
+        help="Apply the planned assignments. Without this flag, only a dry run is printed.",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
-        help=f"SQLite update batch size. Default: {DEFAULT_BATCH_SIZE}",
+        help=f"SQLite assignment batch size. Default: {DEFAULT_BATCH_SIZE}",
     )
     return parser.parse_args()
 
@@ -229,15 +229,15 @@ def iter_coord_row_batches(
         yield rows
 
 
-def plan_updates(
+def plan_assignments(
     conn: sqlite3.Connection,
     table: str,
     grid: RasterGrid,
     *,
     only_null: bool,
     batch_size: int,
-) -> tuple[list[PlannedUpdate], Counter[str], Counter[str], Counter[tuple[str, str]], int, int]:
-    updates: list[PlannedUpdate] = []
+) -> tuple[list[PlannedAssignment], Counter[str], Counter[str], Counter[tuple[str, str]], int, int]:
+    assignments: list[PlannedAssignment] = []
     old_counts: Counter[str] = Counter()
     new_counts: Counter[str] = Counter()
     transitions: Counter[tuple[str, str]] = Counter()
@@ -246,7 +246,7 @@ def plan_updates(
 
     with tqdm(
         total=row_count,
-        desc="update_igbp plan",
+        desc="assign_igbp plan",
         unit="coord",
         dynamic_ncols=True,
     ) as progress:
@@ -287,8 +287,8 @@ def plan_updates(
                     transitions[(old_label, new_igbp)] += 1
 
                     if old_igbp != new_igbp:
-                        updates.append(
-                            PlannedUpdate(
+                        assignments.append(
+                            PlannedAssignment(
                                 rowid=int(rowid),
                                 new_igbp=new_igbp,
                             )
@@ -296,7 +296,7 @@ def plan_updates(
 
             progress.update(len(batch))
 
-    return updates, old_counts, new_counts, transitions, skipped_missing_coords, row_count
+    return assignments, old_counts, new_counts, transitions, skipped_missing_coords, row_count
 
 
 def print_counts(title: str, counts: Counter[str]) -> None:
@@ -312,7 +312,7 @@ def print_summary(
     table: str,
     only_null: bool,
     row_count: int,
-    updates: list[PlannedUpdate],
+    assignments: list[PlannedAssignment],
     old_counts: Counter[str],
     new_counts: Counter[str],
     transitions: Counter[tuple[str, str]],
@@ -328,7 +328,7 @@ def print_summary(
     else:
         print("Scope: all coord_data rows")
     print(f"Rows with missing lat/lon skipped: {skipped_missing_coords:,}")
-    print(f"Rows that would change: {len(updates):,}")
+    print(f"Rows that would be assigned/changed: {len(assignments):,}")
     print()
     print_counts("Current labels in scan scope:", old_counts)
     print()
@@ -340,10 +340,10 @@ def print_summary(
             print(f"  {old_label} -> {new_label}: {count:,}")
 
 
-def apply_updates(
+def apply_assignments(
     conn: sqlite3.Connection,
     table: str,
-    updates: list[PlannedUpdate],
+    assignments: list[PlannedAssignment],
     *,
     batch_size: int,
 ) -> None:
@@ -351,25 +351,25 @@ def apply_updates(
         raise SystemExit("--batch-size must be positive.")
 
     table_sql = quote_identifier(table)
-    update_sql = f"UPDATE {table_sql} SET igbp = ? WHERE rowid = ?"
+    assignment_sql = f"UPDATE {table_sql} SET igbp = ? WHERE rowid = ?"
     started_at = time.monotonic()
 
     with conn:
         with tqdm(
-            total=len(updates),
-            desc="update_igbp write",
+            total=len(assignments),
+            desc="assign_igbp write",
             unit="row",
             dynamic_ncols=True,
         ) as progress:
-            for offset in range(0, len(updates), batch_size):
-                batch = updates[offset : offset + batch_size]
+            for offset in range(0, len(assignments), batch_size):
+                batch = assignments[offset : offset + batch_size]
                 conn.executemany(
-                    update_sql,
-                    [(update.new_igbp, update.rowid) for update in batch],
+                    assignment_sql,
+                    [(assignment.new_igbp, assignment.rowid) for assignment in batch],
                 )
                 progress.update(len(batch))
 
-    print(f"Applied updates in {format_duration(time.monotonic() - started_at)}")
+    print(f"Applied assignments in {format_duration(time.monotonic() - started_at)}")
 
 
 def main() -> int:
@@ -383,7 +383,7 @@ def main() -> int:
     grid = load_c1_raster(c1_path)
     with connect_database(db_path, readonly=not args.write) as conn:
         ensure_coord_table(conn, args.table)
-        updates, old_counts, new_counts, transitions, skipped_missing_coords, row_count = plan_updates(
+        assignments, old_counts, new_counts, transitions, skipped_missing_coords, row_count = plan_assignments(
             conn,
             args.table,
             grid,
@@ -396,7 +396,7 @@ def main() -> int:
             table=args.table,
             only_null=args.only_null,
             row_count=row_count,
-            updates=updates,
+            assignments=assignments,
             old_counts=old_counts,
             new_counts=new_counts,
             transitions=transitions,
@@ -405,14 +405,14 @@ def main() -> int:
 
         if not args.write:
             print()
-            print("Dry run only; rerun with --write to update the database.")
+            print("Dry run only; rerun with --write to assign IGBP in the database.")
             return 0
 
-        if not updates:
-            print("No updates needed.")
+        if not assignments:
+            print("No assignments needed.")
             return 0
 
-        apply_updates(conn, args.table, updates, batch_size=args.batch_size)
+        apply_assignments(conn, args.table, assignments, batch_size=args.batch_size)
 
     return 0
 

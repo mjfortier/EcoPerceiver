@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run selected EcoPerceiver MODIS/ERA5 pipeline steps."""
+"""Run the unified EcoPerceiver ERA5/MODIS data pipeline."""
 
 from __future__ import annotations
 
@@ -18,12 +18,14 @@ except ModuleNotFoundError:
     yaml = None
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "pipeline_config.yml"
 DEFAULT_STEPS = (
-    "update_igbp_from_c1",
-    "index_era5",
+    "download_era5",
+    "process_era5",
+    "download_modis",
+    "assign_igbp_from_c1",
     "transform_modis",
 )
 
@@ -35,17 +37,21 @@ class PipelineStep:
 
 
 STEPS = {
+    "download_era5": PipelineStep(
+        name="download_era5",
+        description="Download ERA5 NetCDF chunks from CDS.",
+    ),
+    "process_era5": PipelineStep(
+        name="process_era5",
+        description="Convert ERA5 NetCDF chunks to the EcoPerceiver SQLite DB.",
+    ),
     "download_modis": PipelineStep(
         name="download_modis",
         description="Download raw MODIS GeoTIFFs from Earth Engine.",
     ),
-    "update_igbp_from_c1": PipelineStep(
-        name="update_igbp_from_c1",
-        description="Update ERA5 coord_data.igbp from a MODIS C1 land-cover raster.",
-    ),
-    "index_era5": PipelineStep(
-        name="index_era5",
-        description="Create persistent ec_data indexes for ERA5 eval and MODIS lookup.",
+    "assign_igbp_from_c1": PipelineStep(
+        name="assign_igbp_from_c1",
+        description="Assign coord_data.igbp from a MODIS C1 land-cover raster.",
     ),
     "transform_modis": PipelineStep(
         name="transform_modis",
@@ -147,10 +153,10 @@ def parse_args() -> argparse.Namespace:
     config, resolved_config_path = load_config(config_args.config_path)
 
     pipeline_config = config_section(config, "pipeline")
-    download_config = config_section(config, "download_modis")
-    update_igbp_config = config_section(config, "update_igbp_from_c1")
+    path_config = config_section(config, "paths")
+    download_modis_config = config_section(config, "download_modis")
+    assign_igbp_config = config_section(config, "assign_igbp_from_c1")
     transform_config = config_section(config, "transform_modis")
-    index_config = config_section(config, "index_era5")
 
     default_steps = config_list(
         pipeline_config.get("steps"),
@@ -166,9 +172,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser = argparse.ArgumentParser(
         parents=[config_parser],
-        description=(
-            "Run selected pieces of the EcoPerceiver ERA5/MODIS pipeline."
-        ),
+        description="Run selected pieces of the unified ERA5/MODIS pipeline.",
     )
     parser.set_defaults(config_path=resolved_config_path)
     parser.add_argument(
@@ -182,16 +186,6 @@ def parse_args() -> argparse.Namespace:
         "--list-steps",
         action="store_true",
         help="Print available pipeline steps and exit.",
-    )
-    parser.add_argument(
-        "--include-download",
-        action=argparse.BooleanOptionalAction,
-        default=bool_config(
-            pipeline_config.get("include_download"),
-            default=False,
-            field_name="pipeline.include_download",
-        ),
-        help="Prepend download_modis to the selected steps if it is not already present.",
     )
     parser.add_argument(
         "--dry-run",
@@ -212,15 +206,33 @@ def parse_args() -> argparse.Namespace:
         "--db-path",
         type=Path,
         default=resolve_repo_path(
-            pipeline_config.get("db_path", "experiments/data/poc_era5.db")
+            path_config.get(
+                "db_path",
+                pipeline_config.get("db_path", "experiments/data/era5.db"),
+            )
         ),
         help="SQLite DB used by ERA5/MODIS pipeline steps.",
     )
+    parser.add_argument(
+        "--limit-era5-groups",
+        type=int,
+        default=None,
+        help="Limit ERA5 request/group count for smoke tests.",
+    )
+    parser.add_argument(
+        "--overwrite-era5-downloads",
+        action="store_true",
+        help="Overwrite existing downloaded ERA5 chunks.",
+    )
+    parser.add_argument(
+        "--overwrite-era5-db",
+        action="store_true",
+        help="Recreate the ERA5 SQLite DB during process_era5.",
+    )
 
-    add_download_args(parser, download_config)
-    add_update_igbp_args(parser, update_igbp_config)
+    add_download_modis_args(parser, download_modis_config)
+    add_assign_igbp_args(parser, assign_igbp_config)
     add_transform_args(parser, transform_config)
-    add_index_era5_args(parser, index_config)
     args = parser.parse_args()
 
     if args.modis_dates is None:
@@ -229,7 +241,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def add_download_args(
+def add_download_modis_args(
     parser: argparse.ArgumentParser,
     config: dict[str, Any],
 ) -> None:
@@ -237,12 +249,12 @@ def add_download_args(
     group.add_argument(
         "--download-start-date",
         default=config.get("start_date"),
-        help="Optional download start date in YYYY-MM-DD format.",
+        help="Optional MODIS download start date in YYYY-MM-DD format.",
     )
     group.add_argument(
         "--download-end-date",
         default=config.get("end_date"),
-        help="Optional download end date in YYYY-MM-DD format.",
+        help="Optional MODIS download end date in YYYY-MM-DD format.",
     )
     group.add_argument(
         "--download-output-dir",
@@ -258,6 +270,12 @@ def add_download_args(
             field_name="download_modis.products",
         ),
         help="Optional MODIS products to download, e.g. A4 A2 C1.",
+    )
+    group.add_argument(
+        "--download-max-workers",
+        type=int,
+        default=config.get("max_workers"),
+        help="Concurrent MODIS tile downloads per image.",
     )
     group.add_argument(
         "--download-overwrite",
@@ -281,18 +299,18 @@ def add_download_args(
     )
 
 
-def add_update_igbp_args(
+def add_assign_igbp_args(
     parser: argparse.ArgumentParser,
     config: dict[str, Any],
 ) -> None:
-    group = parser.add_argument_group("update_igbp_from_c1 options")
+    group = parser.add_argument_group("assign_igbp_from_c1 options")
     group.add_argument(
         "--igbp-c1-path",
         type=Path,
         default=resolve_repo_path(
-            config.get("c1_path", "experiments/data/raw_modis/201801011200C1.tiff")
+            config.get("c1_path", "experiments/data/raw_modis/201701011200C1.tiff")
         ),
-        help="MODIS MCD12C1 GeoTIFF used to update coord_data.igbp.",
+        help="MODIS MCD12C1 GeoTIFF used to assign coord_data.igbp.",
     )
     group.add_argument(
         "--igbp-table",
@@ -305,9 +323,9 @@ def add_update_igbp_args(
         default=bool_config(
             config.get("only_null"),
             default=False,
-            field_name="update_igbp_from_c1.only_null",
+            field_name="assign_igbp_from_c1.only_null",
         ),
-        help="Only update coord_data rows where igbp is NULL.",
+        help="Only assign coord_data rows where igbp is NULL.",
     )
     group.add_argument(
         "--igbp-write",
@@ -315,15 +333,15 @@ def add_update_igbp_args(
         default=bool_config(
             config.get("write"),
             default=True,
-            field_name="update_igbp_from_c1.write",
+            field_name="assign_igbp_from_c1.write",
         ),
-        help="Apply IGBP updates. Use --no-igbp-write to run the updater read-only.",
+        help="Apply IGBP assignments. Use --no-igbp-write to run read-only.",
     )
     group.add_argument(
         "--igbp-batch-size",
         type=int,
         default=config.get("batch_size", 10_000),
-        help="SQLite update batch size for update_igbp_from_c1.",
+        help="SQLite assignment batch size for assign_igbp_from_c1.",
     )
 
 
@@ -382,87 +400,6 @@ def add_transform_args(
     )
 
 
-def add_index_era5_args(
-    parser: argparse.ArgumentParser,
-    config: dict[str, Any],
-) -> None:
-    group = parser.add_argument_group("index_era5 options")
-    group.add_argument(
-        "--era5-index-table",
-        default=config.get("table", "ec_data"),
-        help="ERA5 table to index.",
-    )
-    group.add_argument(
-        "--era5-index-name",
-        default=config.get("index_name", "idx_ec_data_coord_id_timestamp_id"),
-        help="Composite index name used by ERA5 eval.",
-    )
-    group.add_argument(
-        "--era5-index-columns",
-        nargs="+",
-        default=config_list(
-            config.get("columns"),
-            default=["coord_id", "timestamp", "id"],
-            field_name="index_era5.columns",
-        ),
-        help="Columns for the composite ERA5 eval index.",
-    )
-    group.add_argument(
-        "--era5-index-analyze",
-        action=argparse.BooleanOptionalAction,
-        default=bool_config(
-            config.get("analyze"),
-            default=True,
-            field_name="index_era5.analyze",
-        ),
-        help="Run ANALYZE after creating the index.",
-    )
-    group.add_argument(
-        "--era5-index-dry-run",
-        action=argparse.BooleanOptionalAction,
-        default=bool_config(
-            config.get("dry_run"),
-            default=False,
-            field_name="index_era5.dry_run",
-        ),
-        help="Run the index_era5 step in dry-run mode.",
-    )
-    group.add_argument(
-        "--era5-index-temp-dir",
-        type=Path,
-        default=resolve_repo_path(config.get("temp_dir")),
-        help="SQLite temporary sorter directory for the ERA5 index build.",
-    )
-    group.add_argument(
-        "--era5-index-journal-mode",
-        choices=("DELETE", "TRUNCATE", "PERSIST", "WAL"),
-        default=config.get("journal_mode", "DELETE"),
-        help="SQLite journal mode to use while building the ERA5 index.",
-    )
-    group.add_argument(
-        "--era5-index-skip-preflight",
-        action=argparse.BooleanOptionalAction,
-        default=bool_config(
-            config.get("skip_preflight"),
-            default=False,
-            field_name="index_era5.skip_preflight",
-        ),
-        help="Skip disk/page-count estimates before creating the ERA5 index.",
-    )
-    group.add_argument(
-        "--era5-index-progress",
-        choices=("auto", "tqdm", "heartbeat", "none"),
-        default=config.get("progress", "auto"),
-        help="Progress display mode for the ERA5 index step.",
-    )
-    group.add_argument(
-        "--era5-index-threads",
-        type=int,
-        default=config.get("threads", 8),
-        help="SQLite worker threads for the ERA5 index step.",
-    )
-
-
 def print_available_steps(default_steps: list[str]) -> None:
     print(f"Configured default steps: {' '.join(default_steps)}")
     print()
@@ -473,15 +410,47 @@ def print_available_steps(default_steps: list[str]) -> None:
 
 
 def command_for_step(step: str, args: argparse.Namespace) -> list[str]:
+    if step == "download_era5":
+        return download_era5_command(args)
+    if step == "process_era5":
+        return process_era5_command(args)
     if step == "download_modis":
         return download_modis_command(args)
-    if step == "update_igbp_from_c1":
-        return update_igbp_from_c1_command(args)
+    if step == "assign_igbp_from_c1":
+        return assign_igbp_from_c1_command(args)
     if step == "transform_modis":
         return transform_modis_command(args)
-    if step == "index_era5":
-        return index_era5_command(args)
     raise ValueError(f"Unsupported pipeline step: {step}")
+
+
+def download_era5_command(args: argparse.Namespace) -> list[str]:
+    command = [
+        args.python,
+        str(SCRIPT_DIR / "download_era5.py"),
+        "--config",
+        str(args.config_path),
+        "--download-only",
+    ]
+    if args.limit_era5_groups is not None:
+        command.extend(["--limit-groups", str(args.limit_era5_groups)])
+    if args.overwrite_era5_downloads:
+        command.append("--overwrite-downloads")
+    return command
+
+
+def process_era5_command(args: argparse.Namespace) -> list[str]:
+    command = [
+        args.python,
+        str(SCRIPT_DIR / "download_era5.py"),
+        "--config",
+        str(args.config_path),
+        "--process-only",
+    ]
+    if args.limit_era5_groups is not None:
+        command.extend(["--limit-groups", str(args.limit_era5_groups)])
+    if args.overwrite_era5_db:
+        command.append("--overwrite-db")
+    return command
 
 
 def download_modis_command(args: argparse.Namespace) -> list[str]:
@@ -501,6 +470,8 @@ def download_modis_command(args: argparse.Namespace) -> list[str]:
     command.extend(["--output-dir", str(args.download_output_dir)])
     if args.download_products:
         command.extend(["--products", *args.download_products])
+    if args.download_max_workers is not None:
+        command.extend(["--max-workers", str(args.download_max_workers)])
     if args.download_overwrite:
         command.append("--overwrite")
     if args.download_authenticate:
@@ -508,10 +479,10 @@ def download_modis_command(args: argparse.Namespace) -> list[str]:
     return command
 
 
-def update_igbp_from_c1_command(args: argparse.Namespace) -> list[str]:
+def assign_igbp_from_c1_command(args: argparse.Namespace) -> list[str]:
     command = [
         args.python,
-        str(SCRIPT_DIR / "update_igbp_from_c1.py"),
+        str(SCRIPT_DIR / "assign_igbp_from_c1.py"),
         "--db-path",
         str(args.db_path),
         "--c1-path",
@@ -550,33 +521,6 @@ def transform_modis_command(args: argparse.Namespace) -> list[str]:
     return command
 
 
-def index_era5_command(args: argparse.Namespace) -> list[str]:
-    command = [
-        args.python,
-        str(SCRIPT_DIR / "index_era5.py"),
-        "--db-path",
-        str(args.db_path),
-        "--table",
-        args.era5_index_table,
-        "--index-name",
-        args.era5_index_name,
-        "--columns",
-        *args.era5_index_columns,
-    ]
-    if not args.era5_index_analyze:
-        command.append("--no-analyze")
-    if args.era5_index_dry_run:
-        command.append("--dry-run")
-    if args.era5_index_temp_dir is not None:
-        command.extend(["--temp-dir", str(args.era5_index_temp_dir)])
-    command.extend(["--journal-mode", args.era5_index_journal_mode])
-    command.extend(["--progress", args.era5_index_progress])
-    command.extend(["--threads", str(args.era5_index_threads)])
-    if args.era5_index_skip_preflight:
-        command.append("--skip-preflight")
-    return command
-
-
 def run_command(command: list[str], dry_run: bool) -> None:
     print(f"$ {shlex.join(command)}", flush=True)
     if dry_run:
@@ -600,8 +544,6 @@ def main() -> int:
         return 0
 
     steps = list(args.steps)
-    if args.include_download and "download_modis" not in steps:
-        steps.insert(0, "download_modis")
     print(f"Config: {args.config_path}")
     print(f"Selected pipeline steps: {' '.join(steps)}")
     for step in steps:

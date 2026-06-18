@@ -30,9 +30,9 @@ import zipfile
 
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.yml"
+REPO_ROOT = SCRIPT_DIR.parent
+DEFAULT_CONFIG_PATH = SCRIPT_DIR / "pipeline_config.yml"
 DEFAULT_DB_FILENAME = "era5_2016_2017.db"
 
 if str(REPO_ROOT) not in sys.path:
@@ -65,12 +65,6 @@ except ModuleNotFoundError:
     cdsapi = None
 
 try:
-    import rasterio
-except ModuleNotFoundError:
-    MISSING_DEPENDENCIES["rasterio"] = "rasterio"
-    rasterio = None
-
-try:
     from timezonefinder import TimezoneFinder
 except ModuleNotFoundError:
     MISSING_DEPENDENCIES["timezonefinder"] = "timezonefinder"
@@ -82,29 +76,6 @@ except ModuleNotFoundError:
     tqdm = None
 
 from ecoperceiver.constants import DEFAULT_NORM, EC_PREDICTORS
-
-try:
-    from ecoperceiver.constants import IGBP_ACRONYMS_MODIS
-except ImportError:
-    IGBP_ACRONYMS_MODIS = {
-        0: "WAT",
-        1: "ENF",
-        2: "EBF",
-        3: "DNF",
-        4: "DBF",
-        5: "MF",
-        6: "CSH",
-        7: "OSH",
-        8: "WSA",
-        9: "SAV",
-        10: "GRA",
-        11: "WET",
-        12: "CRO",
-        13: "URB",
-        14: "CVM",
-        15: "SNO",
-        16: "BSV",
-    }
 
 
 ERA5_VARIABLES = [
@@ -732,7 +703,7 @@ def init_sqlite(conn: sqlite3.Connection, config: dict[str, Any]) -> None:
         """
     )
     metadata = {
-        "generator": "era5_download/era5/download_era5.py",
+        "generator": "era5_download/download_era5.py",
         "config_metadata": section(config, "metadata"),
         "years": config.get("years"),
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -884,13 +855,15 @@ def datetimes_to_int(values: "pd.Series") -> "pd.Series":
 
 class LandSeaMask:
     def __init__(self, config: dict[str, Any]):
-        mask_config = section(section(config, "processing"), "land_sea_mask")
+        processing_config = section(config, "processing")
+        mask_config = section(processing_config, "land_sea_mask")
+        path_config = section(config, "paths")
         self.enabled = bool(mask_config.get("enabled", False))
         self.threshold = float(mask_config.get("threshold", 0.5))
         self.include_land_neighbors = bool(mask_config.get("include_land_neighbors", True))
         self.cache: dict[tuple[float, float], bool] = {}
         self.da = None
-        path = resolve_path(mask_config.get("path"))
+        path = resolve_path(mask_config.get("path") or path_config.get("lsm_path"))
         if not self.enabled:
             return
         if path is None or not path.exists():
@@ -899,7 +872,10 @@ class LandSeaMask:
                 self.enabled = False
                 return
             raise SystemExit(f"Land-sea mask file does not exist: {path}")
-        ds = xr.open_dataset(path, engine=mask_config.get("xarray_engine"))
+        ds = xr.open_dataset(
+            path,
+            engine=mask_config.get("xarray_engine") or processing_config.get("xarray_engine"),
+        )
         variable = mask_config.get("variable")
         if variable is None:
             variable = "lsm" if "lsm" in ds.data_vars else next(iter(ds.data_vars))
@@ -955,55 +931,6 @@ def neighbor_any(land: np.ndarray) -> np.ndarray:
                 continue
             neighbors |= padded[y_shift : y_shift + land.shape[0], x_shift : x_shift + land.shape[1]]
     return neighbors
-
-
-class IGBPSampler:
-    def __init__(self, config: dict[str, Any]):
-        igbp_config = section(section(config, "processing"), "igbp")
-        self.enabled = bool(igbp_config.get("enabled", False))
-        self.cache: dict[tuple[float, float], str | None] = {}
-        self.src = None
-        path = resolve_path(igbp_config.get("raster_path"))
-        if not self.enabled:
-            return
-        if path is None or not path.exists():
-            if igbp_config.get("allow_missing", False):
-                print(f"IGBP raster not found; writing NULL igbp values: {path}", file=sys.stderr)
-                self.enabled = False
-                return
-            raise SystemExit(f"IGBP raster does not exist: {path}")
-        if rasterio is None:
-            if igbp_config.get("allow_missing", False):
-                print("rasterio is not installed; writing NULL igbp values.", file=sys.stderr)
-                self.enabled = False
-                return
-            ensure_dependencies("rasterio")
-        self.src = rasterio.open(path)
-
-    def assign(self, df: "pd.DataFrame") -> "pd.DataFrame":
-        if not self.enabled or self.src is None or df.empty:
-            df["igbp"] = None
-            return df
-        coords = df[["lat", "lon"]].drop_duplicates()
-        missing_rows = [
-            row
-            for row in coords.itertuples(index=False)
-            if rounded_coord_key(row.lat, row.lon) not in self.cache
-        ]
-        if missing_rows:
-            points = [(float(row.lon), float(row.lat)) for row in missing_rows]
-            for row, sample in zip(missing_rows, self.src.sample(points)):
-                raw_value = sample[0]
-                key = rounded_coord_key(row.lat, row.lon)
-                try:
-                    code = int(raw_value)
-                except (TypeError, ValueError):
-                    self.cache[key] = None
-                else:
-                    self.cache[key] = IGBP_ACRONYMS_MODIS.get(code)
-        keys = pd.MultiIndex.from_frame(df[["lat", "lon"]].round(6))
-        df["igbp"] = keys.map(self.cache)
-        return df
 
 
 class Era5DatabaseWriter:
@@ -1082,7 +1009,6 @@ class Era5PostProcessor:
         self.xarray_engine = processing_config.get("xarray_engine")
         self.timezone_resolver = TimezoneResolver(config)
         self.land_mask = LandSeaMask(config)
-        self.igbp_sampler = IGBPSampler(config)
         self.writer = Era5DatabaseWriter(conn, self.batch_size)
         self.local_window = self.parse_local_window()
 
@@ -1139,7 +1065,7 @@ class Era5PostProcessor:
         if df.empty:
             return 0
         df = self.add_predictors(df)
-        df = self.igbp_sampler.assign(df)
+        df["igbp"] = None
         df = self.timezone_resolver.localize_frame(df, utc_timestamp)
         df = self.apply_local_window(df)
         if df.empty:

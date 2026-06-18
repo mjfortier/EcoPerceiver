@@ -1,3 +1,13 @@
+pipeline:
+  steps:
+    - download_era5
+    - process_era5
+    # - download_modis
+    # - assign_igbp_from_c1
+    # - transform_modis
+  dry_run: false
+  python: null
+
 years:
   - 2016
   - 2017
@@ -7,6 +17,7 @@ paths:
   db_path: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017/era5_2016_2017.db
   netcdf_dir: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017/era5_data
   zip_dir: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017/era5_zip
+  lsm_path: experiments/data/lsm.nc
 
 download:
   enabled: true
@@ -57,8 +68,6 @@ processing:
     # "local" stores wall-clock timestamps per coordinate. Half-hour offsets
     # produce timestamps such as YYYYMMDDHH3000.
     timestamp_policy: local
-    # Use timezonefinder/IANA zones when installed. If a coordinate has no
-    # zone, fall back to longitude-based quarter-hour offsets.
     method: timezonefinder
     require_timezonefinder: true
     fallback: longitude_quarter_hour
@@ -69,12 +78,30 @@ processing:
 
   land_sea_mask:
     enabled: true
-    path: experiments/data/lsm.nc
     threshold: 0.5
     include_land_neighbors: true
     allow_missing: false
 
-  igbp:
-    enabled: true
-    raster_path: experiments/data/raw_modis/201701011200C1.tiff
-    allow_missing: false
+download_modis:
+  start_date: "2016-01-01"
+  end_date: "2017-12-31"
+  output_dir: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017/raw_modis
+  products: null
+  max_workers: 8
+  overwrite: false
+  authenticate: false
+
+assign_igbp_from_c1:
+  c1_path: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017/raw_modis/201701011200C1.tiff
+  table: coord_data
+  only_null: false
+  write: true
+  batch_size: 10000
+
+transform_modis:
+  input_dir: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017/raw_modis
+  dates: []
+  limit_dates: null
+  example_count: 10
+  overwrite: false
+  active_ec_coords_only: false
