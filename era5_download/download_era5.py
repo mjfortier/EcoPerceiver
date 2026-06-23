@@ -1082,12 +1082,28 @@ def nullable_float(value) -> float | None:
     return value
 
 
+@dataclass(frozen=True)
+class Era5GroupGrid:
+    lat: np.ndarray
+    lon: np.ndarray
+    land_indices: np.ndarray
+    spatial_shape: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class Era5TimeBlock:
+    variables: dict[str, np.ndarray]
+    length: int
+
+
 class Era5PostProcessor:
     def __init__(self, config: dict[str, Any], conn: sqlite3.Connection):
         processing_config = section(config, "processing")
         self.config = config
         self.conn = conn
         self.batch_size = int(processing_config.get("batch_size", 50_000))
+        time_block_size = processing_config.get("time_block_size")
+        self.time_block_size = int(time_block_size) if time_block_size else None
         self.xarray_engine = processing_config.get("xarray_engine")
         self.timezone_resolver = TimezoneResolver(config)
         self.land_mask = LandSeaMask(config)
@@ -1112,10 +1128,29 @@ class Era5PostProcessor:
 
         total_rows = 0
         print(f"NetCDF groups to process: {len(group_dirs)}")
-        for group_dir in group_dirs:
+        progress = (
+            tqdm(
+                group_dirs,
+                desc="ERA5 processing",
+                unit="group",
+                dynamic_ncols=True,
+                file=sys.stdout,
+            )
+            if tqdm is not None
+            else group_dirs
+        )
+        for group_dir in progress:
             rows = self.process_group(group_dir)
             total_rows += rows
-            print(f"[inserted] {rows:,} rows from {group_dir}")
+            if tqdm is not None:
+                progress.set_postfix(
+                    last_rows=f"{rows:,}",
+                    total_rows=f"{total_rows:,}",
+                    refresh=False,
+                )
+                progress.write(f"[inserted] {rows:,} rows from {group_dir}")
+            else:
+                print(f"[inserted] {rows:,} rows from {group_dir}")
         return total_rows
 
     def process_group(self, group_dir: Path) -> int:
@@ -1129,21 +1164,123 @@ class Era5PostProcessor:
             if "valid_time" not in ds.coords:
                 raise RuntimeError(f"Dataset has no valid_time coordinate: {group_dir}")
             inserted = 0
+            group_grid = self.prepare_group_grid(ds)
             valid_times = pd.to_datetime(ds["valid_time"].values)
-            for time_index, valid_time in enumerate(valid_times):
-                frame = ds.isel(valid_time=time_index).to_dataframe().reset_index()
-                inserted += self.process_frame(frame, pd.Timestamp(valid_time))
+            time_block_size = self.infer_time_block_size(ds, len(valid_times))
+            for block_start in range(0, len(valid_times), time_block_size):
+                block_end = min(block_start + time_block_size, len(valid_times))
+                block = self.land_block_from_dataset(ds, group_grid, block_start, block_end)
+                for block_offset, valid_time in enumerate(valid_times[block_start:block_end]):
+                    frame = self.land_frame_from_block(group_grid, block, block_offset)
+                    inserted += self.process_land_frame(frame, pd.Timestamp(valid_time))
             self.conn.commit()
             return inserted
         finally:
             for ds in datasets:
                 ds.close()
 
-    def process_frame(self, df: "pd.DataFrame", utc_timestamp: "pd.Timestamp") -> int:
-        df = standardize_dataframe(df)
-        if df.empty:
-            return 0
-        df = self.land_mask.filter(df)
+    def prepare_group_grid(self, ds) -> Era5GroupGrid:
+        if "latitude" not in ds.coords or "longitude" not in ds.coords:
+            raise RuntimeError("ERA5 dataset is missing latitude/longitude coordinates.")
+
+        lats = np.asarray(ds["latitude"].values, dtype=float)
+        lons = normalize_longitudes(np.asarray(ds["longitude"].values, dtype=float))
+        lat_flat = np.repeat(lats, len(lons))
+        lon_flat = np.tile(lons, len(lats))
+        coord_frame = pd.DataFrame({"lat": lat_flat, "lon": lon_flat})
+        land_frame = self.land_mask.filter(coord_frame)
+        land_indices = land_frame.index.to_numpy(dtype=np.int64)
+        return Era5GroupGrid(
+            lat=lat_flat[land_indices],
+            lon=lon_flat[land_indices],
+            land_indices=land_indices,
+            spatial_shape=(len(lats), len(lons)),
+        )
+
+    def infer_time_block_size(self, ds, valid_time_count: int) -> int:
+        if self.time_block_size is not None:
+            return max(1, min(int(self.time_block_size), valid_time_count))
+        for data_array in ds.data_vars.values():
+            if "valid_time" not in data_array.dims:
+                continue
+            preferred_chunks = data_array.encoding.get("preferred_chunks") or {}
+            chunk_size = preferred_chunks.get("valid_time")
+            if chunk_size is None:
+                chunksizes = data_array.encoding.get("chunksizes")
+                if chunksizes:
+                    chunk_size = chunksizes[data_array.dims.index("valid_time")]
+            if chunk_size:
+                return max(1, min(int(chunk_size), valid_time_count))
+        return min(24, valid_time_count)
+
+    def land_block_from_dataset(
+        self,
+        ds,
+        group_grid: Era5GroupGrid,
+        block_start: int,
+        block_end: int,
+    ) -> Era5TimeBlock:
+        block_length = block_end - block_start
+        variables: dict[str, np.ndarray] = {}
+        spatial_dims = {"latitude", "longitude"}
+        allowed_dims = {"valid_time", *spatial_dims}
+
+        for name, data_array in ds.data_vars.items():
+            if not spatial_dims.issubset(data_array.dims):
+                continue
+            values = data_array
+            if "valid_time" in values.dims:
+                values = values.isel(valid_time=slice(block_start, block_end))
+            for dim in tuple(values.dims):
+                if dim in allowed_dims:
+                    continue
+                if values.sizes[dim] != 1:
+                    raise RuntimeError(
+                        f"Cannot convert ERA5 variable {name!r}; unexpected dimension "
+                        f"{dim!r} has size {values.sizes[dim]}."
+                    )
+                values = values.isel({dim: 0}, drop=True)
+
+            if "valid_time" in values.dims:
+                arr = np.asarray(values.transpose("valid_time", "latitude", "longitude").values)
+                expected_shape = (block_length, *group_grid.spatial_shape)
+                if arr.shape != expected_shape:
+                    raise RuntimeError(
+                        f"ERA5 variable {name!r} has shape {arr.shape}, expected "
+                        f"{expected_shape}."
+                    )
+                variables[name] = arr.reshape(block_length, -1)[:, group_grid.land_indices]
+            else:
+                arr = np.asarray(values.transpose("latitude", "longitude").values)
+                if arr.shape != group_grid.spatial_shape:
+                    raise RuntimeError(
+                        f"ERA5 variable {name!r} has shape {arr.shape}, expected "
+                        f"{group_grid.spatial_shape}."
+                    )
+                land_values = arr.reshape(-1)[group_grid.land_indices]
+                variables[name] = np.broadcast_to(
+                    land_values,
+                    (block_length, len(group_grid.land_indices)),
+                )
+        return Era5TimeBlock(variables=variables, length=block_length)
+
+    def land_frame_from_block(
+        self,
+        group_grid: Era5GroupGrid,
+        block: Era5TimeBlock,
+        block_offset: int,
+    ) -> "pd.DataFrame":
+        data: dict[str, np.ndarray] = {
+            "lat": group_grid.lat,
+            "lon": group_grid.lon,
+        }
+        if block_offset < 0 or block_offset >= block.length:
+            raise IndexError(f"Block offset {block_offset} is outside block length {block.length}.")
+        for name, values in block.variables.items():
+            data[name] = values[block_offset]
+        return pd.DataFrame(data, copy=False)
+
+    def process_land_frame(self, df: "pd.DataFrame", utc_timestamp: "pd.Timestamp") -> int:
         if df.empty:
             return 0
         df = self.add_predictors(df)
@@ -1230,25 +1367,6 @@ def standardize_dataset(ds):
     return ds.rename({**rename_map, **coord_renames})
 
 
-def standardize_dataframe(df: "pd.DataFrame") -> "pd.DataFrame":
-    rename_map = {
-        "latitude": "lat",
-        "longitude": "lon",
-        "valid_time": "timestamp_utc",
-        "time": "timestamp_utc",
-    }
-    df = df.rename(columns={old: new for old, new in rename_map.items() if old in df.columns})
-    for column in ["number", "expver", "region_id", "spatial_ref"]:
-        if column in df.columns:
-            df = df.drop(columns=column)
-    if "lat" not in df.columns or "lon" not in df.columns:
-        raise RuntimeError("ERA5 frame is missing latitude/longitude columns.")
-    df = df.dropna(subset=["lat", "lon"]).copy()
-    df["lat"] = df["lat"].astype(float)
-    df["lon"] = normalize_longitudes(df["lon"])
-    return df
-
-
 def minmax_normalization(df: "pd.DataFrame") -> "pd.DataFrame":
     for predictor in EC_PREDICTORS:
         if predictor not in df.columns:
@@ -1277,7 +1395,7 @@ def minmax_normalization(df: "pd.DataFrame") -> "pd.DataFrame":
 
 def configure_sqlite(conn: sqlite3.Connection, config: dict[str, Any]) -> None:
     processing_config = section(config, "processing")
-    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA journal_mode = DELETE")
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA temp_store = FILE")
     conn.execute(f"PRAGMA threads = {int(processing_config.get('sqlite_threads', 8))}")
