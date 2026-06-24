@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import calendar
-from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -35,10 +34,11 @@ import numpy as np
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "pipeline_config.yml"
-DEFAULT_DB_FILENAME = "era5_2016_2017.db"
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from config_utils import configured_date_range, inferred_pipeline_paths
 
 MISSING_DEPENDENCIES: dict[str, str] = {}
 
@@ -389,7 +389,7 @@ def parse_args() -> argparse.Namespace:
         "--max-workers",
         type=int,
         default=None,
-        help="Override download.max_workers for concurrent CDS downloads.",
+        help="Override download_era5.max_workers for concurrent CDS downloads.",
     )
     args = parser.parse_args()
 
@@ -442,23 +442,9 @@ def resolve_path(value: str | os.PathLike | None, *, default: Path | None = None
     return (REPO_ROOT / path).resolve()
 
 
-def years_to_range(years: Iterable[int | str]) -> tuple[datetime, datetime]:
-    year_values = sorted(int(year) for year in years)
-    if not year_values:
-        raise SystemExit("Config field 'years' must contain at least one year.")
-    start = datetime(year_values[0], 1, 1, 0, 0, 0)
-    end = datetime(year_values[-1], 12, 31, 23, 0, 0)
-    return start, end
-
-
 def configured_time_range(config: dict[str, Any]) -> tuple[datetime, datetime]:
-    download_config = section(config, "download")
-    if download_config.get("start") and download_config.get("end"):
-        return (
-            datetime.fromisoformat(str(download_config["start"])),
-            datetime.fromisoformat(str(download_config["end"])),
-        )
-    return years_to_range(config.get("years", []))
+    date_range = configured_date_range(config)
+    return date_range.start_datetime, date_range.end_datetime
 
 
 def full_hours() -> list[str]:
@@ -512,10 +498,10 @@ def build_request_groups(config: dict[str, Any]) -> list[RequestGroup]:
     if end < start:
         raise SystemExit(f"Download end date is before start date: {start} > {end}")
 
-    download_config = section(config, "download")
+    download_config = section(config, "download_era5")
     bbox = download_config.get("bbox", [90, -180, -90, 180])
     if not isinstance(bbox, list) or len(bbox) != 4:
-        raise SystemExit("download.bbox must be [north, west, south, east].")
+        raise SystemExit("download_era5.bbox must be [north, west, south, east].")
     areas = split_bbox_latitude_bands(
         bbox,
         download_config.get("latitude_band_degrees"),
@@ -553,7 +539,7 @@ def build_request_groups(config: dict[str, Any]) -> list[RequestGroup]:
             continue
 
         if chunk not in {"daily", "monthly"}:
-            raise SystemExit("download.temporal_chunk must be 'daily' or 'monthly'.")
+            raise SystemExit("download_era5.temporal_chunk must be 'daily' or 'monthly'.")
 
         for day in iter_day_starts(active_start, active_end):
             day_start = datetime(day.year, day.month, day.day, 0, 0, 0)
@@ -575,7 +561,7 @@ def build_request_groups(config: dict[str, Any]) -> list[RequestGroup]:
 
 
 def cds_request_payload(config: dict[str, Any], group: RequestGroup) -> dict[str, Any]:
-    download_config = section(config, "download")
+    download_config = section(config, "download_era5")
     product_type = download_config.get("product_type", "reanalysis")
     variables = download_config.get("variables") or ERA5_VARIABLES
     return {
@@ -598,28 +584,24 @@ def extract_zip(zip_path: Path, output_dir: Path) -> None:
 
 
 def configured_download_workers(config: dict[str, Any], args: argparse.Namespace) -> int:
-    download_config = section(config, "download")
+    download_config = section(config, "download_era5")
     value = args.max_workers
     if value is None:
         value = download_config.get("max_workers", 1)
     try:
         workers = int(value)
     except (TypeError, ValueError) as exc:
-        raise SystemExit("download.max_workers must be an integer >= 1.") from exc
+        raise SystemExit("download_era5.max_workers must be an integer >= 1.") from exc
     if workers < 1:
-        raise SystemExit("download.max_workers must be an integer >= 1.")
+        raise SystemExit("download_era5.max_workers must be an integer >= 1.")
     return workers
 
 
 def download_groups(config: dict[str, Any], args: argparse.Namespace) -> None:
-    paths = section(config, "paths")
-    download_config = section(config, "download")
-    zip_dir = resolve_path(paths.get("zip_dir"), default=REPO_ROOT / "experiments/data/era5_zip")
-    netcdf_dir = resolve_path(
-        paths.get("netcdf_dir"),
-        default=REPO_ROOT / "experiments/data/era5_data",
-    )
-    assert zip_dir is not None and netcdf_dir is not None
+    inferred_paths = inferred_pipeline_paths(config, REPO_ROOT)
+    download_config = section(config, "download_era5")
+    zip_dir = inferred_paths.zip_dir
+    netcdf_dir = inferred_paths.netcdf_dir
 
     groups = build_request_groups(config)
     if args.limit_groups is not None:
@@ -784,10 +766,13 @@ def init_sqlite(conn: sqlite3.Connection, config: dict[str, Any]) -> None:
         );
         """
     )
+    date_range = configured_date_range(config)
     metadata = {
-        "generator": "era5_download/download_era5.py",
+        "generator": "era5_pipeline/download_era5.py",
         "config_metadata": section(config, "metadata"),
-        "years": config.get("years"),
+        "start_date": date_range.start.isoformat(),
+        "end_date": date_range.end.isoformat(),
+        "date_range_label": date_range.label,
         "created_utc": datetime.now(timezone.utc).isoformat(),
     }
     conn.executemany(
@@ -814,7 +799,7 @@ def rounded_coord_key(lat: float, lon: float) -> tuple[float, float]:
 
 class TimezoneResolver:
     def __init__(self, config: dict[str, Any]):
-        timezone_config = section(section(config, "processing"), "timezone")
+        timezone_config = section(section(config, "process_era5"), "timezone")
         self.enabled = bool(timezone_config.get("enabled", True))
         self.timestamp_policy = str(timezone_config.get("timestamp_policy", "local")).lower()
         self.method = str(timezone_config.get("method", "timezonefinder")).lower()
@@ -937,8 +922,8 @@ def datetimes_to_int(values: "pd.Series") -> "pd.Series":
 
 class LandSeaMask:
     def __init__(self, config: dict[str, Any]):
-        processing_config = section(config, "processing")
-        mask_config = section(processing_config, "land_sea_mask")
+        process_config = section(config, "process_era5")
+        mask_config = section(process_config, "land_sea_mask")
         path_config = section(config, "paths")
         self.enabled = bool(mask_config.get("enabled", False))
         self.threshold = float(mask_config.get("threshold", 0.5))
@@ -956,7 +941,7 @@ class LandSeaMask:
             raise SystemExit(f"Land-sea mask file does not exist: {path}")
         ds = xr.open_dataset(
             path,
-            engine=mask_config.get("xarray_engine") or processing_config.get("xarray_engine"),
+            engine=mask_config.get("xarray_engine") or process_config.get("xarray_engine"),
         )
         variable = mask_config.get("variable")
         if variable is None:
@@ -1098,25 +1083,26 @@ class Era5TimeBlock:
 
 class Era5PostProcessor:
     def __init__(self, config: dict[str, Any], conn: sqlite3.Connection):
-        processing_config = section(config, "processing")
+        process_config = section(config, "process_era5")
         self.config = config
         self.conn = conn
-        self.batch_size = int(processing_config.get("batch_size", 50_000))
-        time_block_size = processing_config.get("time_block_size")
+        self.batch_size = int(process_config.get("batch_size", 50_000))
+        time_block_size = process_config.get("time_block_size")
         self.time_block_size = int(time_block_size) if time_block_size else None
-        self.xarray_engine = processing_config.get("xarray_engine")
+        self.xarray_engine = process_config.get("xarray_engine")
         self.timezone_resolver = TimezoneResolver(config)
         self.land_mask = LandSeaMask(config)
         self.writer = Era5DatabaseWriter(conn, self.batch_size)
         self.local_window = self.parse_local_window()
 
     def parse_local_window(self) -> tuple["pd.Timestamp | None", "pd.Timestamp | None"]:
-        timezone_config = section(section(self.config, "processing"), "timezone")
+        timezone_config = section(section(self.config, "process_era5"), "timezone")
         window_config = section(timezone_config, "local_window")
         if not window_config.get("enabled", False):
             return None, None
-        start = pd.Timestamp(window_config["start"]) if window_config.get("start") else None
-        end = pd.Timestamp(window_config["end"]) if window_config.get("end") else None
+        date_range = configured_date_range(self.config)
+        start = pd.Timestamp(window_config.get("start") or date_range.local_window_start)
+        end = pd.Timestamp(window_config.get("end") or date_range.local_window_end)
         return start, end
 
     def process_groups(self, netcdf_dir: Path, limit_groups: int | None = None) -> int:
@@ -1394,12 +1380,16 @@ def minmax_normalization(df: "pd.DataFrame") -> "pd.DataFrame":
 
 
 def configure_sqlite(conn: sqlite3.Connection, config: dict[str, Any]) -> None:
-    processing_config = section(config, "processing")
+    process_config = section(config, "process_era5")
+    inferred_paths = inferred_pipeline_paths(config, REPO_ROOT)
     conn.execute("PRAGMA journal_mode = DELETE")
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA temp_store = FILE")
-    conn.execute(f"PRAGMA threads = {int(processing_config.get('sqlite_threads', 8))}")
-    temp_dir = resolve_path(processing_config.get("sqlite_temp_dir"))
+    conn.execute(f"PRAGMA threads = {int(process_config.get('sqlite_threads', 8))}")
+    temp_dir = resolve_path(
+        process_config.get("sqlite_temp_dir"),
+        default=inferred_paths.sqlite_temp_dir,
+    )
     if temp_dir is not None:
         temp_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -1407,29 +1397,14 @@ def configure_sqlite(conn: sqlite3.Connection, config: dict[str, Any]) -> None:
         except sqlite3.OperationalError as exc:
             print(f"Could not set sqlite temp_store_directory: {exc}", file=sys.stderr)
 
-
-def create_indexes(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_ec_data_coord_id_timestamp_id
-        ON ec_data(coord_id, timestamp, id)
-        """
-    )
-    conn.execute("ANALYZE")
-
-
 def process_to_database(config: dict[str, Any], args: argparse.Namespace) -> None:
-    paths = section(config, "paths")
-    output_dir = resolve_path(
-        paths.get("output_dir"),
-        default=REPO_ROOT / "experiments/data/raw_era5",
-    )
-    db_path = resolve_path(paths.get("db_path"), default=output_dir / DEFAULT_DB_FILENAME)
-    netcdf_dir = resolve_path(paths.get("netcdf_dir"), default=output_dir / "era5_data")
-    assert output_dir is not None and db_path is not None and netcdf_dir is not None
+    inferred_paths = inferred_pipeline_paths(config, REPO_ROOT)
+    output_dir = inferred_paths.output_dir
+    db_path = inferred_paths.db_path
+    netcdf_dir = inferred_paths.netcdf_dir
 
-    processing_config = section(config, "processing")
-    recreate_db = bool(processing_config.get("recreate_db", True) or args.overwrite_db)
+    process_config = section(config, "process_era5")
+    recreate_db = bool(process_config.get("recreate_db", True) or args.overwrite_db)
     if args.dry_run:
         groups = list(iter_netcdf_group_dirs(netcdf_dir)) if netcdf_dir.exists() else []
         print(f"Would process {len(groups)} NetCDF group(s) into {db_path}")
@@ -1445,9 +1420,6 @@ def process_to_database(config: dict[str, Any], args: argparse.Namespace) -> Non
         init_sqlite(conn, config)
         processor = Era5PostProcessor(config, conn)
         total_rows = processor.process_groups(netcdf_dir, args.limit_groups)
-        if processing_config.get("create_index", True):
-            print("Creating SQLite indexes...")
-            create_indexes(conn)
         conn.commit()
     print(f"SQLite export complete: {db_path} ({total_rows:,} ec_data rows inserted)")
 
@@ -1456,7 +1428,7 @@ def main() -> int:
     args = parse_args()
     config = load_config(args.config)
 
-    download_enabled = bool(section(config, "download").get("enabled", True))
+    download_enabled = bool(section(config, "download_era5").get("enabled", True))
     if not args.process_only and download_enabled:
         download_groups(config, args)
     elif args.download_only:

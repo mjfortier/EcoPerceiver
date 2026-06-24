@@ -2,24 +2,21 @@ pipeline:
   steps:
     - download_era5
     - process_era5
+    # - index_era5
     # - download_modis
-    # - assign_igbp_from_c1
-    # - transform_modis
+    # - assign_igbp_from_modis
+    # - process_modis
   dry_run: false
   python: null
 
-years:
-  - 2016
-  - 2017
+start_date: "2016-01-01"
+end_date: "2017-12-31"
 
 paths:
-  output_dir: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017
-  db_path: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017/era5_2016_2017.db
-  netcdf_dir: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017/era5_data
-  zip_dir: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017/era5_zip
+  data_root: /home/l/luislara/links/projects/aip-pal/luislara/ep/data
   lsm_path: experiments/data/lsm.nc
 
-download:
+download_era5:
   enabled: true
   dataset: reanalysis-era5-single-levels
   product_type: reanalysis
@@ -54,12 +51,10 @@ download:
     - friction_velocity
     - geopotential
 
-processing:
+process_era5:
   recreate_db: true
   batch_size: 50000
   xarray_engine: h5netcdf
-  create_index: true
-  sqlite_temp_dir: null
   sqlite_threads: 8
 
   timezone:
@@ -72,8 +67,6 @@ processing:
     fallback: longitude_quarter_hour
     local_window:
       enabled: true
-      start: "2016-01-01 00:00:00"
-      end: "2017-12-31 23:59:59"
 
   land_sea_mask:
     enabled: true
@@ -81,24 +74,34 @@ processing:
     include_land_neighbors: true
     allow_missing: false
 
+index_era5:
+  table: ec_data
+  index_name: idx_ec_data_coord_id_timestamp_id
+  columns:
+    - coord_id
+    - timestamp
+    - id
+  journal_mode: DELETE
+  skip_preflight: false
+  progress: auto
+  threads: 8
+  analyze: true
+  dry_run: false
+
 download_modis:
-  start_date: "2016-01-01"
-  end_date: "2017-12-31"
-  output_dir: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017/raw_modis
   products: null
   max_workers: 8
   overwrite: false
   authenticate: false
 
-assign_igbp_from_c1:
-  c1_path: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017/raw_modis/201701011200C1.tiff
+assign_igbp_from_modis:
+  modis_path: 201701011200C1.tiff
   table: coord_data
   only_null: false
   write: true
   batch_size: 10000
 
-transform_modis:
-  input_dir: /home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017/raw_modis
+process_modis:
   dates: []
   limit_dates: null
   example_count: 10

@@ -24,7 +24,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from ecoperceiver.constants import IGBP_ACRONYMS_MODIS
 
 DEFAULT_DB_PATH = Path("/home/l/luislara/links/projects/aip-pal/luislara/ep/data/era5.db")
-DEFAULT_C1_PATH = REPO_ROOT / "experiments" / "data" / "raw_modis" / "201801011200C1.tiff"
+DEFAULT_MODIS_PATH = REPO_ROOT / "experiments" / "data" / "raw_modis" / "201801011200C1.tiff"
 DEFAULT_TABLE = "coord_data"
 DEFAULT_BATCH_SIZE = 10_000
 SQLITE_TIMEOUT_SECONDS = 60.0
@@ -65,10 +65,10 @@ def parse_args() -> argparse.Namespace:
         help=f"SQLite database to modify. Default: {DEFAULT_DB_PATH}",
     )
     parser.add_argument(
-        "--c1-path",
+        "--modis-path",
         type=Path,
-        default=DEFAULT_C1_PATH,
-        help=f"MODIS MCD12C1 GeoTIFF. Default: {DEFAULT_C1_PATH}",
+        default=DEFAULT_MODIS_PATH,
+        help=f"MODIS MCD12C1 GeoTIFF. Default: {DEFAULT_MODIS_PATH}",
     )
     parser.add_argument(
         "--table",
@@ -308,7 +308,7 @@ def print_counts(title: str, counts: Counter[str]) -> None:
 def print_summary(
     *,
     db_path: Path,
-    c1_path: Path,
+    modis_path: Path,
     table: str,
     only_null: bool,
     row_count: int,
@@ -319,7 +319,7 @@ def print_summary(
     skipped_missing_coords: int,
 ) -> None:
     print(f"DB: {db_path}")
-    print(f"C1: {c1_path}")
+    print(f"MODIS: {modis_path}")
     print(f"Table: {table}")
     print("Sampling: nearest coord_data lat/lon point")
     print(f"Rows scanned: {row_count:,}")
@@ -375,12 +375,12 @@ def apply_assignments(
 def main() -> int:
     args = parse_args()
     db_path = resolve_path(args.db_path)
-    c1_path = resolve_path(args.c1_path)
+    modis_path = resolve_path(args.modis_path)
 
     if not db_path.exists():
         raise SystemExit(f"Database does not exist: {db_path}")
 
-    grid = load_c1_raster(c1_path)
+    grid = load_c1_raster(modis_path)
     with connect_database(db_path, readonly=not args.write) as conn:
         ensure_coord_table(conn, args.table)
         assignments, old_counts, new_counts, transitions, skipped_missing_coords, row_count = plan_assignments(
@@ -392,7 +392,7 @@ def main() -> int:
         )
         print_summary(
             db_path=db_path,
-            c1_path=c1_path,
+            modis_path=modis_path,
             table=args.table,
             only_null=args.only_null,
             row_count=row_count,

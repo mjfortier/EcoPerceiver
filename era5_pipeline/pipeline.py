@@ -17,6 +17,13 @@ try:
 except ModuleNotFoundError:
     yaml = None
 
+from config_utils import (
+    PipelineDateRange,
+    PipelinePaths,
+    configured_date_range,
+    inferred_pipeline_paths,
+)
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -24,9 +31,6 @@ DEFAULT_CONFIG_PATH = SCRIPT_DIR / "pipeline_config.yml"
 DEFAULT_STEPS = (
     "download_era5",
     "process_era5",
-    "download_modis",
-    "assign_igbp_from_c1",
-    "transform_modis",
 )
 
 
@@ -45,17 +49,21 @@ STEPS = {
         name="process_era5",
         description="Convert ERA5 NetCDF chunks to the EcoPerceiver SQLite DB.",
     ),
+    "index_era5": PipelineStep(
+        name="index_era5",
+        description="Create persistent ec_data indexes for ERA5 eval and MODIS lookup.",
+    ),
     "download_modis": PipelineStep(
         name="download_modis",
         description="Download raw MODIS GeoTIFFs from Earth Engine.",
     ),
-    "assign_igbp_from_c1": PipelineStep(
-        name="assign_igbp_from_c1",
-        description="Assign coord_data.igbp from a MODIS C1 land-cover raster.",
+    "assign_igbp_from_modis": PipelineStep(
+        name="assign_igbp_from_modis",
+        description="Assign coord_data.igbp from a MODIS land-cover raster.",
     ),
-    "transform_modis": PipelineStep(
-        name="transform_modis",
-        description="Transform MODIS GeoTIFFs into modis_data SQLite rows.",
+    "process_modis": PipelineStep(
+        name="process_modis",
+        description="Process MODIS GeoTIFFs into modis_data SQLite rows.",
     ),
 }
 
@@ -153,10 +161,12 @@ def parse_args() -> argparse.Namespace:
     config, resolved_config_path = load_config(config_args.config_path)
 
     pipeline_config = config_section(config, "pipeline")
-    path_config = config_section(config, "paths")
+    date_range = configured_date_range(config)
+    inferred_paths = inferred_pipeline_paths(config, REPO_ROOT)
+    index_era5_config = config_section(config, "index_era5")
     download_modis_config = config_section(config, "download_modis")
-    assign_igbp_config = config_section(config, "assign_igbp_from_c1")
-    transform_config = config_section(config, "transform_modis")
+    assign_igbp_config = config_section(config, "assign_igbp_from_modis")
+    process_modis_config = config_section(config, "process_modis")
 
     default_steps = config_list(
         pipeline_config.get("steps"),
@@ -166,9 +176,9 @@ def parse_args() -> argparse.Namespace:
     validate_steps(default_steps)
 
     default_modis_dates = config_list(
-        transform_config.get("dates"),
+        process_modis_config.get("dates"),
         default=[],
-        field_name="transform_modis.dates",
+        field_name="process_modis.dates",
     )
     parser = argparse.ArgumentParser(
         parents=[config_parser],
@@ -205,12 +215,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--db-path",
         type=Path,
-        default=resolve_repo_path(
-            path_config.get(
-                "db_path",
-                pipeline_config.get("db_path", "experiments/data/era5.db"),
-            )
-        ),
+        default=resolve_repo_path(pipeline_config.get("db_path")) or inferred_paths.db_path,
         help="SQLite DB used by ERA5/MODIS pipeline steps.",
     )
     parser.add_argument(
@@ -223,7 +228,7 @@ def parse_args() -> argparse.Namespace:
         "--era5-max-workers",
         type=int,
         default=None,
-        help="Override download.max_workers for concurrent ERA5 CDS downloads.",
+        help="Override download_era5.max_workers for concurrent ERA5 CDS downloads.",
     )
     parser.add_argument(
         "--overwrite-era5-downloads",
@@ -236,9 +241,10 @@ def parse_args() -> argparse.Namespace:
         help="Recreate the ERA5 SQLite DB during process_era5.",
     )
 
-    add_download_modis_args(parser, download_modis_config)
-    add_assign_igbp_args(parser, assign_igbp_config)
-    add_transform_args(parser, transform_config)
+    add_index_era5_args(parser, index_era5_config, inferred_paths)
+    add_download_modis_args(parser, download_modis_config, date_range, inferred_paths)
+    add_assign_igbp_args(parser, assign_igbp_config, inferred_paths)
+    add_process_modis_args(parser, process_modis_config, inferred_paths)
     args = parser.parse_args()
 
     if args.modis_dates is None:
@@ -249,25 +255,109 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def add_index_era5_args(
+    parser: argparse.ArgumentParser,
+    config: dict[str, Any],
+    inferred_paths: PipelinePaths,
+) -> None:
+    group = parser.add_argument_group("index_era5 options")
+    group.add_argument(
+        "--era5-index-table",
+        default=config.get("table", "ec_data"),
+        help="ERA5 table to index.",
+    )
+    group.add_argument(
+        "--era5-index-name",
+        default=config.get("index_name", "idx_ec_data_coord_id_timestamp_id"),
+        help="Composite index name used by ERA5 eval.",
+    )
+    group.add_argument(
+        "--era5-index-columns",
+        nargs="+",
+        default=config_list(
+            config.get("columns"),
+            default=["coord_id", "timestamp", "id"],
+            field_name="index_era5.columns",
+        ),
+        help="Columns for the composite ERA5 eval index.",
+    )
+    group.add_argument(
+        "--era5-index-analyze",
+        action=argparse.BooleanOptionalAction,
+        default=bool_config(
+            config.get("analyze"),
+            default=True,
+            field_name="index_era5.analyze",
+        ),
+        help="Run ANALYZE after creating the index.",
+    )
+    group.add_argument(
+        "--era5-index-dry-run",
+        action=argparse.BooleanOptionalAction,
+        default=bool_config(
+            config.get("dry_run"),
+            default=False,
+            field_name="index_era5.dry_run",
+        ),
+        help="Run the index_era5 step in dry-run mode.",
+    )
+    group.add_argument(
+        "--era5-index-temp-dir",
+        type=Path,
+        default=resolve_repo_path(config.get("temp_dir")) or inferred_paths.sqlite_temp_dir,
+        help="SQLite temporary sorter directory for the ERA5 index build.",
+    )
+    group.add_argument(
+        "--era5-index-journal-mode",
+        choices=("DELETE", "TRUNCATE", "PERSIST", "WAL"),
+        default=config.get("journal_mode", "DELETE"),
+        help="SQLite journal mode to use while building the ERA5 index.",
+    )
+    group.add_argument(
+        "--era5-index-skip-preflight",
+        action=argparse.BooleanOptionalAction,
+        default=bool_config(
+            config.get("skip_preflight"),
+            default=False,
+            field_name="index_era5.skip_preflight",
+        ),
+        help="Skip disk/page-count estimates before creating the ERA5 index.",
+    )
+    group.add_argument(
+        "--era5-index-progress",
+        choices=("auto", "tqdm", "heartbeat", "none"),
+        default=config.get("progress", "auto"),
+        help="Progress display mode for the ERA5 index step.",
+    )
+    group.add_argument(
+        "--era5-index-threads",
+        type=int,
+        default=config.get("threads", 8),
+        help="SQLite worker threads for the ERA5 index step.",
+    )
+
+
 def add_download_modis_args(
     parser: argparse.ArgumentParser,
     config: dict[str, Any],
+    date_range: PipelineDateRange,
+    inferred_paths: PipelinePaths,
 ) -> None:
     group = parser.add_argument_group("download_modis options")
     group.add_argument(
         "--download-start-date",
-        default=config.get("start_date"),
+        default=config.get("start_date") or date_range.start.isoformat(),
         help="Optional MODIS download start date in YYYY-MM-DD format.",
     )
     group.add_argument(
         "--download-end-date",
-        default=config.get("end_date"),
+        default=config.get("end_date") or date_range.end.isoformat(),
         help="Optional MODIS download end date in YYYY-MM-DD format.",
     )
     group.add_argument(
         "--download-output-dir",
         type=Path,
-        default=resolve_repo_path(config.get("output_dir", "experiments/data/raw_modis")),
+        default=resolve_repo_path(config.get("output_dir")) or inferred_paths.raw_modis_dir,
         help="MODIS download output directory.",
     )
     group.add_argument(
@@ -310,14 +400,14 @@ def add_download_modis_args(
 def add_assign_igbp_args(
     parser: argparse.ArgumentParser,
     config: dict[str, Any],
+    inferred_paths: PipelinePaths,
 ) -> None:
-    group = parser.add_argument_group("assign_igbp_from_c1 options")
+    group = parser.add_argument_group("assign_igbp_from_modis options")
     group.add_argument(
-        "--igbp-c1-path",
+        "--igbp-modis-path",
+        dest="igbp_modis_path",
         type=Path,
-        default=resolve_repo_path(
-            config.get("c1_path", "experiments/data/raw_modis/201701011200C1.tiff")
-        ),
+        default=inferred_paths.modis_landcover_path,
         help="MODIS MCD12C1 GeoTIFF used to assign coord_data.igbp.",
     )
     group.add_argument(
@@ -331,7 +421,7 @@ def add_assign_igbp_args(
         default=bool_config(
             config.get("only_null"),
             default=False,
-            field_name="assign_igbp_from_c1.only_null",
+            field_name="assign_igbp_from_modis.only_null",
         ),
         help="Only assign coord_data rows where igbp is NULL.",
     )
@@ -341,7 +431,7 @@ def add_assign_igbp_args(
         default=bool_config(
             config.get("write"),
             default=True,
-            field_name="assign_igbp_from_c1.write",
+            field_name="assign_igbp_from_modis.write",
         ),
         help="Apply IGBP assignments. Use --no-igbp-write to run read-only.",
     )
@@ -349,19 +439,20 @@ def add_assign_igbp_args(
         "--igbp-batch-size",
         type=int,
         default=config.get("batch_size", 10_000),
-        help="SQLite assignment batch size for assign_igbp_from_c1.",
+        help="SQLite assignment batch size for assign_igbp_from_modis.",
     )
 
 
-def add_transform_args(
+def add_process_modis_args(
     parser: argparse.ArgumentParser,
     config: dict[str, Any],
+    inferred_paths: PipelinePaths,
 ) -> None:
-    group = parser.add_argument_group("transform_modis options")
+    group = parser.add_argument_group("process_modis options")
     group.add_argument(
         "--modis-input-dir",
         type=Path,
-        default=resolve_repo_path(config.get("input_dir", "experiments/data/raw_modis")),
+        default=resolve_repo_path(config.get("input_dir")) or inferred_paths.raw_modis_dir,
         help="Raw MODIS GeoTIFF directory.",
     )
     group.add_argument(
@@ -370,7 +461,7 @@ def add_transform_args(
         action="append",
         default=None,
         help=(
-            "Specific MODIS timestamp to transform, e.g. 201712031200. "
+            "Specific MODIS timestamp to process, e.g. 201712031200. "
             "Repeat for multiple dates."
         ),
     )
@@ -378,13 +469,13 @@ def add_transform_args(
         "--limit-modis-dates",
         type=int,
         default=config.get("limit_dates"),
-        help="Limit the number of MODIS timestamp pairs transformed.",
+        help="Limit the number of MODIS timestamp pairs processed.",
     )
     group.add_argument(
         "--modis-example-count",
         type=int,
         default=config.get("example_count", 10),
-        help="Number of transformed MODIS example cells to print.",
+        help="Number of processed MODIS example cells to print.",
     )
     group.add_argument(
         "--overwrite-modis",
@@ -392,7 +483,7 @@ def add_transform_args(
         default=bool_config(
             config.get("overwrite"),
             default=False,
-            field_name="transform_modis.overwrite",
+            field_name="process_modis.overwrite",
         ),
         help="Overwrite existing modis_data rows for matching coord/date pairs.",
     )
@@ -402,9 +493,9 @@ def add_transform_args(
         default=bool_config(
             config.get("active_ec_coords_only"),
             default=True,
-            field_name="transform_modis.active_ec_coords_only",
+            field_name="process_modis.active_ec_coords_only",
         ),
-        help="Only transform MODIS for coord_id values that remain in ec_data.",
+        help="Only process MODIS for coord_id values that remain in ec_data.",
     )
 
 
@@ -422,12 +513,14 @@ def command_for_step(step: str, args: argparse.Namespace) -> list[str]:
         return download_era5_command(args)
     if step == "process_era5":
         return process_era5_command(args)
+    if step == "index_era5":
+        return index_era5_command(args)
     if step == "download_modis":
         return download_modis_command(args)
-    if step == "assign_igbp_from_c1":
-        return assign_igbp_from_c1_command(args)
-    if step == "transform_modis":
-        return transform_modis_command(args)
+    if step == "assign_igbp_from_modis":
+        return assign_igbp_from_modis_command(args)
+    if step == "process_modis":
+        return process_modis_command(args)
     raise ValueError(f"Unsupported pipeline step: {step}")
 
 
@@ -463,6 +556,33 @@ def process_era5_command(args: argparse.Namespace) -> list[str]:
     return command
 
 
+def index_era5_command(args: argparse.Namespace) -> list[str]:
+    command = [
+        args.python,
+        str(SCRIPT_DIR / "index_era5.py"),
+        "--db-path",
+        str(args.db_path),
+        "--table",
+        args.era5_index_table,
+        "--index-name",
+        args.era5_index_name,
+        "--columns",
+        *args.era5_index_columns,
+    ]
+    if not args.era5_index_analyze:
+        command.append("--no-analyze")
+    if args.era5_index_dry_run:
+        command.append("--dry-run")
+    if args.era5_index_temp_dir is not None:
+        command.extend(["--temp-dir", str(args.era5_index_temp_dir)])
+    command.extend(["--journal-mode", args.era5_index_journal_mode])
+    command.extend(["--progress", args.era5_index_progress])
+    command.extend(["--threads", str(args.era5_index_threads)])
+    if args.era5_index_skip_preflight:
+        command.append("--skip-preflight")
+    return command
+
+
 def download_modis_command(args: argparse.Namespace) -> list[str]:
     command = [
         args.python,
@@ -489,14 +609,14 @@ def download_modis_command(args: argparse.Namespace) -> list[str]:
     return command
 
 
-def assign_igbp_from_c1_command(args: argparse.Namespace) -> list[str]:
+def assign_igbp_from_modis_command(args: argparse.Namespace) -> list[str]:
     command = [
         args.python,
-        str(SCRIPT_DIR / "assign_igbp_from_c1.py"),
+        str(SCRIPT_DIR / "assign_igbp_from_modis.py"),
         "--db-path",
         str(args.db_path),
-        "--c1-path",
-        str(args.igbp_c1_path),
+        "--modis-path",
+        str(args.igbp_modis_path),
         "--table",
         args.igbp_table,
         "--batch-size",
@@ -509,10 +629,10 @@ def assign_igbp_from_c1_command(args: argparse.Namespace) -> list[str]:
     return command
 
 
-def transform_modis_command(args: argparse.Namespace) -> list[str]:
+def process_modis_command(args: argparse.Namespace) -> list[str]:
     command = [
         args.python,
-        str(SCRIPT_DIR / "transform_modis.py"),
+        str(SCRIPT_DIR / "process_modis.py"),
         "--input-dir",
         str(args.modis_input_dir),
         "--db-path",

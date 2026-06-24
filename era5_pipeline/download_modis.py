@@ -132,7 +132,8 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Download global MODIS rasters for an inclusive date range. "
             "Annual C1 land-cover files are downloaded once per year touched "
-            "by the requested range. Defaults to 2016-01-01 through 2017-12-31."
+            f"by the requested range. Defaults to {DEFAULT_START_DATE.isoformat()} "
+            f"through {DEFAULT_END_DATE.isoformat()}."
         )
     )
     parser.add_argument(
