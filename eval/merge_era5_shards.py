@@ -4,11 +4,35 @@ import io
 import shutil
 import subprocess
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 INTERNAL_ORDER_COLUMN = "__sample_order"
 BASE_OUTPUT_COLUMNS = ("lat", "lon", "igbp", "timestamp")
 DEFAULT_SORT_COLUMNS = ("lat", "lon", "timestamp")
+ERA5_TIME_DIM = "valid_time"
+ERA5_SPATIAL_DIMS = ("latitude", "longitude")
+ERA5_CUBE_DIMS = (ERA5_TIME_DIM, *ERA5_SPATIAL_DIMS)
+ERA5_COORDINATES_ATTR = "number valid_time latitude longitude expver"
+COORDINATE_DECIMALS = 6
+REGULAR_GRID_MIN_COVERAGE = 0.9
+ERA5_CHUNK_TARGETS = (186, 31, 360)
+ERA5_GLOBAL_ATTRS = {
+    "GRIB_centre": "ecmf",
+    "GRIB_centreDescription": "European Centre for Medium-Range Weather Forecasts",
+    "GRIB_subCentre": 0,
+    "Conventions": "CF-1.7",
+    "institution": "European Centre for Medium-Range Weather Forecasts",
+}
+PREDICTION_TARGET_METADATA = {
+    "NEE": ("Predicted net ecosystem exchange", "umol CO2 m-2 s-1"),
+    "GPP_DT": ("Predicted daytime gross primary productivity", "umol CO2 m-2 s-1"),
+    "GPP_NT": ("Predicted nighttime gross primary productivity", "umol CO2 m-2 s-1"),
+    "RECO_DT": ("Predicted daytime ecosystem respiration", "umol CO2 m-2 s-1"),
+    "RECO_NT": ("Predicted nighttime ecosystem respiration", "umol CO2 m-2 s-1"),
+    "FCH4": ("Predicted methane flux", "nmol CH4 m-2 s-1"),
+    "LE": ("Predicted latent heat flux", "W m-2"),
+}
 
 
 def parse_args():
@@ -349,7 +373,11 @@ def write_netcdf_from_csv_shards(
     )
 
     output_tmp = output_netcdf_path.with_suffix(output_netcdf_path.suffix + ".tmp")
-    dataset.to_netcdf(output_tmp, engine="h5netcdf")
+    dataset.to_netcdf(
+        output_tmp,
+        engine="h5netcdf",
+        encoding=era5_netcdf_encoding(dataset, np),
+    )
     output_tmp.replace(output_netcdf_path)
 
 
@@ -416,37 +444,37 @@ def build_era5_cube_dataset(df, output_columns, num_shards, duplicate_policy, np
             raise ValueError(f"Unsupported NetCDF duplicate policy: {duplicate_policy}")
 
     timestamps = np.sort(df["timestamp"].astype("int64").unique())
-    latitudes = np.sort(df["lat"].astype("float64").unique())[::-1]
-    longitudes = np.sort(df["lon"].astype("float64").unique())
+    latitudes = regularize_coordinate_axis(
+        np.sort(df["lat"].astype("float64").unique())[::-1],
+        descending=True,
+        np=np,
+    )
+    longitudes = regularize_coordinate_axis(
+        np.sort(df["lon"].astype("float64").unique()),
+        descending=False,
+        np=np,
+    )
 
     time_lookup = {value: index for index, value in enumerate(timestamps)}
-    lat_lookup = {value: index for index, value in enumerate(latitudes)}
-    lon_lookup = {value: index for index, value in enumerate(longitudes)}
+    lat_lookup = coordinate_lookup(latitudes)
+    lon_lookup = coordinate_lookup(longitudes)
 
     time_indices = df["timestamp"].map(time_lookup).to_numpy(dtype=np.int64)
-    lat_indices = df["lat"].map(lat_lookup).to_numpy(dtype=np.int64)
-    lon_indices = df["lon"].map(lon_lookup).to_numpy(dtype=np.int64)
+    lat_indices = map_coordinate_indices(df["lat"], lat_lookup, np)
+    lon_indices = map_coordinate_indices(df["lon"], lon_lookup, np)
 
     coords = {
-        "time": ("time", timestamp_to_time_coordinate(timestamps, np, pd)),
+        "number": np.asarray(0, dtype=np.int64),
+        ERA5_TIME_DIM: (
+            ERA5_TIME_DIM,
+            timestamp_to_valid_time_coordinate(timestamps, np, pd),
+        ),
         "latitude": ("latitude", latitudes),
         "longitude": ("longitude", longitudes),
+        "expver": (ERA5_TIME_DIM, np.full(len(timestamps), "0001", dtype="<U4")),
     }
     data_vars = {}
     cube_shape = (len(timestamps), len(latitudes), len(longitudes))
-
-    if "igbp" in output_columns:
-        add_igbp_variable(
-            data_vars,
-            df,
-            cube_shape,
-            lat_indices,
-            lon_indices,
-            time_indices,
-            lat_lookup,
-            lon_lookup,
-            np,
-        )
 
     for column in output_columns:
         if column in BASE_OUTPUT_COLUMNS:
@@ -461,10 +489,34 @@ def build_era5_cube_dataset(df, output_columns, num_shards, duplicate_policy, np
             array = np.full(cube_shape, "", dtype=object)
 
         array[time_indices, lat_indices, lon_indices] = values
-        data_vars[column] = (("time", "latitude", "longitude"), array)
+        data_vars[column] = (
+            ERA5_CUBE_DIMS,
+            array,
+            prediction_variable_attrs(column, latitudes, longitudes, np),
+        )
+
+    if "igbp" in output_columns:
+        add_igbp_variable(
+            data_vars,
+            df,
+            cube_shape,
+            lat_indices,
+            lon_indices,
+            time_indices,
+            lat_lookup,
+            lon_lookup,
+            np,
+        )
 
     dataset = xr.Dataset(data_vars=data_vars, coords=coords)
+    dataset = dataset.transpose(*ERA5_CUBE_DIMS, missing_dims="ignore")
+    dataset.attrs.update(ERA5_GLOBAL_ATTRS)
+    dataset.attrs["title"] = "EcoPerceiver predictions on an ERA5 latitude-longitude grid"
     dataset.attrs["source"] = "EcoPerceiver ERA5 torchrun inference shards"
+    dataset.attrs["history"] = (
+        f"{datetime.now(timezone.utc).isoformat()} EcoPerceiver predictions "
+        "converted to ERA5-like NetCDF via eval/merge_era5_shards.py"
+    )
     dataset.attrs["num_shards"] = num_shards
     dataset.attrs["num_input_rows"] = input_row_count
     dataset.attrs["num_output_rows"] = int(len(df))
@@ -473,16 +525,199 @@ def build_era5_cube_dataset(df, output_columns, num_shards, duplicate_policy, np
     dataset.attrs["num_duplicate_coordinate_groups"] = duplicate_group_count
     dataset.attrs["timestamp_source_column"] = "timestamp"
     dataset.attrs["timestamp_source_format"] = "YYYYMMDDHHMMSS"
+    dataset.attrs["timestamp_coordinate"] = ERA5_TIME_DIM
+    dataset.attrs["timestamp_note"] = (
+        "valid_time coordinate values are parsed from the shard timestamp "
+        "column. They may be local wall-clock times when the source ERA5 "
+        "database was built with local timestamp_policy."
+    )
 
-    dataset["time"].attrs["long_name"] = "time"
+    dataset["number"].attrs["long_name"] = "ensemble member numerical id"
+    dataset["number"].attrs["units"] = "1"
+    dataset["number"].attrs["standard_name"] = "realization"
+    dataset[ERA5_TIME_DIM].attrs["long_name"] = "time"
+    dataset[ERA5_TIME_DIM].attrs["standard_name"] = "time"
     dataset["latitude"].attrs["long_name"] = "latitude"
     dataset["latitude"].attrs["units"] = "degrees_north"
+    dataset["latitude"].attrs["standard_name"] = "latitude"
+    dataset["latitude"].attrs["stored_direction"] = "decreasing"
     dataset["longitude"].attrs["long_name"] = "longitude"
     dataset["longitude"].attrs["units"] = "degrees_east"
+    dataset["longitude"].attrs["standard_name"] = "longitude"
     return dataset
 
 
-def timestamp_to_time_coordinate(timestamps, np, pd):
+def coordinate_key(value) -> float:
+    return round(float(value), COORDINATE_DECIMALS)
+
+
+def coordinate_lookup(values) -> dict[float, int]:
+    return {coordinate_key(value): index for index, value in enumerate(values)}
+
+
+def map_coordinate_indices(series, lookup: dict[float, int], np):
+    indices = []
+    missing = []
+    for value in series:
+        index = lookup.get(coordinate_key(value))
+        if index is None:
+            missing.append(float(value))
+            continue
+        indices.append(index)
+
+    if missing:
+        examples = ", ".join(str(value) for value in missing[:5])
+        raise RuntimeError(
+            "Cannot map coordinate value(s) onto the NetCDF grid. "
+            f"Examples: {examples}"
+        )
+    return np.asarray(indices, dtype=np.int64)
+
+
+def regularize_coordinate_axis(values, descending: bool, np):
+    values = np.asarray(values, dtype=np.float64)
+    if values.size < 3:
+        return values
+
+    ascending_values = values[::-1] if descending else values
+    diffs = np.diff(ascending_values)
+    positive_diffs = diffs[diffs > 0]
+    if positive_diffs.size == 0:
+        return values
+
+    rounded_diffs = np.round(positive_diffs, COORDINATE_DECIMALS)
+    unique_diffs, counts = np.unique(rounded_diffs, return_counts=True)
+    step = float(unique_diffs[np.argmax(counts)])
+    if step <= 0 or not np.isfinite(step):
+        return values
+
+    span = float(ascending_values[-1] - ascending_values[0])
+    expected_count = int(round(span / step)) + 1
+    if expected_count <= values.size:
+        return values
+
+    coverage = values.size / expected_count
+    if coverage < REGULAR_GRID_MIN_COVERAGE:
+        return values
+
+    regular_axis = np.round(
+        ascending_values[0] + np.arange(expected_count, dtype=np.float64) * step,
+        COORDINATE_DECIMALS,
+    )
+    if descending:
+        regular_axis = regular_axis[::-1]
+    return regular_axis
+
+
+def prediction_variable_attrs(column: str, latitudes, longitudes, np) -> dict[str, object]:
+    target = column.removeprefix("pred_").removeprefix("gt_")
+    long_name, units = PREDICTION_TARGET_METADATA.get(
+        target,
+        (column.replace("_", " "), "unknown"),
+    )
+    if column.startswith("gt_"):
+        long_name = f"Ground truth {long_name.removeprefix('Predicted ').lower()}"
+
+    lat_increment = coordinate_increment(latitudes, np)
+    lon_increment = coordinate_increment(longitudes, np)
+    attrs: dict[str, object] = {
+        "long_name": long_name,
+        "units": units,
+        "standard_name": "unknown",
+        "coordinates": ERA5_COORDINATES_ATTR,
+        "GRIB_dataType": "fc",
+        "GRIB_numberOfPoints": int(len(latitudes) * len(longitudes)),
+        "GRIB_stepType": "instant",
+        "GRIB_stepUnits": 1,
+        "GRIB_gridType": "regular_ll",
+        "GRIB_typeOfLevel": "surface",
+        "GRIB_uvRelativeToGrid": 0,
+        "GRIB_NV": 0,
+        "GRIB_cfName": "unknown",
+        "GRIB_cfVarName": column,
+        "GRIB_shortName": column,
+        "GRIB_gridDefinitionDescription": "Latitude/Longitude Grid",
+        "GRIB_iDirectionIncrementInDegrees": lon_increment,
+        "GRIB_iScansNegatively": 0,
+        "GRIB_jDirectionIncrementInDegrees": lat_increment,
+        "GRIB_jPointsAreConsecutive": 0,
+        "GRIB_jScansPositively": 0,
+        "GRIB_latitudeOfFirstGridPointInDegrees": float(latitudes[0]) if len(latitudes) else np.nan,
+        "GRIB_latitudeOfLastGridPointInDegrees": float(latitudes[-1]) if len(latitudes) else np.nan,
+        "GRIB_longitudeOfFirstGridPointInDegrees": float(longitudes[0]) if len(longitudes) else np.nan,
+        "GRIB_longitudeOfLastGridPointInDegrees": float(longitudes[-1]) if len(longitudes) else np.nan,
+        "GRIB_Nx": int(len(longitudes)),
+        "GRIB_Ny": int(len(latitudes)),
+        "GRIB_missingValue": float(np.finfo(np.float32).max),
+        "GRIB_name": long_name,
+        "GRIB_totalNumber": 0,
+        "GRIB_units": units,
+        "GRIB_surface": 0.0,
+    }
+    return attrs
+
+
+def coordinate_increment(values, np) -> float:
+    if len(values) < 2:
+        return float("nan")
+    diffs = np.diff(np.asarray(values, dtype=np.float64))
+    return float(abs(np.nanmedian(diffs)))
+
+
+def era5_netcdf_encoding(dataset, np) -> dict[str, dict[str, object]]:
+    encoding: dict[str, dict[str, object]] = {
+        "number": {"dtype": "int64"},
+        "latitude": {"dtype": "float64", "_FillValue": np.nan},
+        "longitude": {"dtype": "float64", "_FillValue": np.nan},
+    }
+    if np.issubdtype(dataset[ERA5_TIME_DIM].dtype, np.datetime64):
+        encoding[ERA5_TIME_DIM] = {
+            "dtype": "int64",
+            "units": "seconds since 1970-01-01",
+            "calendar": "proleptic_gregorian",
+        }
+    else:
+        encoding[ERA5_TIME_DIM] = {"dtype": "int64"}
+
+    if all(dim in dataset.sizes for dim in ERA5_CUBE_DIMS):
+        cube_chunks = era5_cube_chunks(
+            tuple(int(dataset.sizes[dim]) for dim in ERA5_CUBE_DIMS)
+        )
+    else:
+        cube_chunks = None
+
+    for name, variable in dataset.data_vars.items():
+        if variable.dtype.kind in {"f", "i", "u"}:
+            variable_encoding: dict[str, object] = {
+                "zlib": True,
+                "complevel": 1,
+                "shuffle": True,
+            }
+            if variable.dtype.kind == "f":
+                variable_encoding["dtype"] = str(variable.dtype)
+                variable_encoding["_FillValue"] = (
+                    np.float32(np.nan) if variable.dtype == np.float32 else np.nan
+                )
+            if variable.dims == ERA5_CUBE_DIMS and cube_chunks is not None:
+                variable_encoding["chunksizes"] = cube_chunks
+            elif variable.dims == ERA5_SPATIAL_DIMS:
+                variable_encoding["chunksizes"] = cube_chunks[1:] if cube_chunks is not None else None
+            encoding[name] = {
+                key: value
+                for key, value in variable_encoding.items()
+                if value is not None
+            }
+    return encoding
+
+
+def era5_cube_chunks(shape: tuple[int, int, int]) -> tuple[int, int, int]:
+    return tuple(
+        max(1, min(size, target))
+        for size, target in zip(shape, ERA5_CHUNK_TARGETS)
+    )
+
+
+def timestamp_to_valid_time_coordinate(timestamps, np, pd):
     timestamp_text = pd.Series(timestamps).astype("int64").astype(str)
     lengths = set(timestamp_text.str.len())
     if lengths == {14}:
@@ -527,20 +762,34 @@ def add_igbp_variable(
     igbp_is_static = bool((unique_by_cell <= 1).all())
 
     if igbp_is_static:
-        array = np.full(cube_shape[1:], "", dtype=object)
+        array = np.full(cube_shape[1:], "", dtype="<U3")
         cell_values = (
             df.assign(igbp=igbp_values)[["lat", "lon", "igbp"]]
             .drop_duplicates(["lat", "lon"])
         )
-        cell_lat_indices = cell_values["lat"].map(lat_lookup).to_numpy(dtype=np.int64)
-        cell_lon_indices = cell_values["lon"].map(lon_lookup).to_numpy(dtype=np.int64)
-        array[cell_lat_indices, cell_lon_indices] = cell_values["igbp"].to_numpy(dtype=object)
-        data_vars["igbp"] = (("latitude", "longitude"), array)
+        cell_lat_indices = map_coordinate_indices(cell_values["lat"], lat_lookup, np)
+        cell_lon_indices = map_coordinate_indices(cell_values["lon"], lon_lookup, np)
+        array[cell_lat_indices, cell_lon_indices] = cell_values["igbp"].to_numpy(dtype="<U3")
+        data_vars["igbp"] = (
+            ERA5_SPATIAL_DIMS,
+            array,
+            {
+                "long_name": "IGBP land cover class",
+                "coordinates": "latitude longitude",
+            },
+        )
         return
 
-    array = np.full(cube_shape, "", dtype=object)
-    array[time_indices, lat_indices, lon_indices] = igbp_values.to_numpy(dtype=object)
-    data_vars["igbp"] = (("time", "latitude", "longitude"), array)
+    array = np.full(cube_shape, "", dtype="<U3")
+    array[time_indices, lat_indices, lon_indices] = igbp_values.to_numpy(dtype="<U3")
+    data_vars["igbp"] = (
+        ERA5_CUBE_DIMS,
+        array,
+        {
+            "long_name": "IGBP land cover class",
+            "coordinates": ERA5_COORDINATES_ATTR,
+        },
+    )
 
 
 def resolve_output_path(args: argparse.Namespace) -> Path:
