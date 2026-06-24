@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import json
 import math
@@ -783,8 +783,6 @@ def init_sqlite(conn: sqlite3.Connection, config: dict[str, Any]) -> None:
         """,
         [(key, json.dumps(value, sort_keys=True)) for key, value in metadata.items()],
     )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_coord_data_lat_lon ON coord_data(lat, lon)")
-
 
 def normalize_longitudes(values) -> np.ndarray:
     arr = np.asarray(values, dtype=float)
@@ -806,7 +804,7 @@ class TimezoneResolver:
         self.fallback = str(timezone_config.get("fallback", "longitude_quarter_hour")).lower()
         self.require_timezonefinder = bool(timezone_config.get("require_timezonefinder", True))
         self.zone_cache: dict[tuple[float, float], str | None] = {}
-        self.offset_cache: dict[tuple[str | None, datetime, float], int] = {}
+        self.zone_offset_cache: dict[tuple[str, datetime], int | None] = {}
         self.timezone_finder = None
         if self.enabled and self.method == "timezonefinder":
             if TimezoneFinder is None:
@@ -820,73 +818,6 @@ class TimezoneResolver:
             else:
                 self.timezone_finder = TimezoneFinder()
 
-    def localize_frame(self, df: "pd.DataFrame", utc_timestamp: "pd.Timestamp") -> "pd.DataFrame":
-        if not self.enabled:
-            return self._assign_utc_time(df, utc_timestamp)
-
-        utc_ts = pd.Timestamp(utc_timestamp)
-        if utc_ts.tzinfo is None:
-            utc_ts = utc_ts.tz_localize("UTC")
-        else:
-            utc_ts = utc_ts.tz_convert("UTC")
-        utc_dt = utc_ts.to_pydatetime()
-
-        coord_offsets = self.offset_minutes_for_coordinates(
-            df[["lat", "lon"]].drop_duplicates(),
-            utc_dt,
-        )
-        keys = pd.MultiIndex.from_frame(df[["lat", "lon"]].round(6))
-        offset_minutes = keys.map(coord_offsets).to_numpy(dtype=np.int32)
-
-        utc_naive = utc_ts.tz_localize(None)
-        local_datetimes = utc_naive + pd.to_timedelta(offset_minutes, unit="m")
-        if isinstance(local_datetimes, pd.Timestamp):
-            local_series = pd.Series([local_datetimes] * len(df), index=df.index)
-        else:
-            local_series = pd.Series(local_datetimes, index=df.index)
-
-        df["_local_timestamp"] = datetimes_to_int(local_series)
-        if self.timestamp_policy == "local":
-            df["timestamp"] = df["_local_timestamp"]
-        else:
-            df["timestamp"] = datetimes_to_int(pd.Series(utc_naive, index=df.index))
-        df["DOY"] = local_series.dt.dayofyear.astype(float)
-        tod = (
-            local_series.dt.hour.astype(float)
-            + local_series.dt.minute.astype(float) / 60.0
-            + local_series.dt.second.astype(float) / 3600.0
-            + 1.0
-        )
-        df["TOD"] = tod.where(tod <= 24.0, tod - 24.0)
-        return df
-
-    def _assign_utc_time(self, df: "pd.DataFrame", utc_timestamp: "pd.Timestamp") -> "pd.DataFrame":
-        utc_ts = pd.Timestamp(utc_timestamp)
-        if utc_ts.tzinfo is not None:
-            utc_ts = utc_ts.tz_convert("UTC").tz_localize(None)
-        df["timestamp"] = int(utc_ts.strftime("%Y%m%d%H%M%S"))
-        df["_local_timestamp"] = df["timestamp"]
-        df["DOY"] = float(utc_ts.dayofyear)
-        df["TOD"] = float(utc_ts.hour + 1)
-        return df
-
-    def offset_minutes_for_coordinates(
-        self,
-        coords: "pd.DataFrame",
-        utc_dt: datetime,
-    ) -> dict[tuple[float, float], int]:
-        offsets: dict[tuple[float, float], int] = {}
-        for row in coords.itertuples(index=False):
-            lat = float(row.lat)
-            lon = float(row.lon)
-            key = rounded_coord_key(lat, lon)
-            zone_name = self.zone_for_coordinate(lat, lon)
-            cache_key = (zone_name, utc_dt.replace(tzinfo=timezone.utc), round(lon, 6))
-            if cache_key not in self.offset_cache:
-                self.offset_cache[cache_key] = self.offset_for_zone(zone_name, lon, utc_dt)
-            offsets[key] = self.offset_cache[cache_key]
-        return offsets
-
     def zone_for_coordinate(self, lat: float, lon: float) -> str | None:
         key = rounded_coord_key(lat, lon)
         if key in self.zone_cache:
@@ -899,25 +830,28 @@ class TimezoneResolver:
         self.zone_cache[key] = zone_name
         return zone_name
 
-    def offset_for_zone(self, zone_name: str | None, lon: float, utc_dt: datetime) -> int:
-        if zone_name:
-            try:
-                local_dt = utc_dt.astimezone(ZoneInfo(zone_name))
-                offset = local_dt.utcoffset()
-                if offset is not None:
-                    return int(offset.total_seconds() // 60)
-            except ZoneInfoNotFoundError:
-                pass
-        if self.fallback in {"longitude_quarter_hour", "longitude"}:
-            minutes = lon * 4.0
-            if self.fallback == "longitude_quarter_hour":
-                minutes = round(minutes / 15.0) * 15.0
-            return int(max(-12 * 60, min(14 * 60, minutes)))
-        return 0
+    def fallback_offsets_for_longitudes(self, lons: np.ndarray) -> np.ndarray:
+        if self.fallback not in {"longitude_quarter_hour", "longitude"}:
+            return np.zeros(len(lons), dtype=np.int32)
+        minutes = np.asarray(lons, dtype=float) * 4.0
+        if self.fallback == "longitude_quarter_hour":
+            minutes = np.round(minutes / 15.0) * 15.0
+        minutes = np.clip(minutes, -12 * 60, 14 * 60)
+        return minutes.astype(np.int32)
 
-
-def datetimes_to_int(values: "pd.Series") -> "pd.Series":
-    return values.dt.strftime("%Y%m%d%H%M%S").astype("int64")
+    def offset_for_named_zone(self, zone_name: str, utc_dt: datetime) -> int | None:
+        utc_key = utc_dt.replace(tzinfo=timezone.utc)
+        cache_key = (zone_name, utc_key)
+        if cache_key in self.zone_offset_cache:
+            return self.zone_offset_cache[cache_key]
+        try:
+            local_dt = utc_dt.astimezone(ZoneInfo(zone_name))
+            offset = local_dt.utcoffset()
+            minutes = int(offset.total_seconds() // 60) if offset is not None else None
+        except ZoneInfoNotFoundError:
+            minutes = None
+        self.zone_offset_cache[cache_key] = minutes
+        return minutes
 
 
 class LandSeaMask:
@@ -1014,21 +948,32 @@ class Era5DatabaseWriter:
             self.coord_lookup[rounded_coord_key(lat, lon)] = int(coord_id)
             self.next_coord_id = max(self.next_coord_id, int(coord_id) + 1)
 
-    def assign_coord_ids(self, df: "pd.DataFrame") -> "pd.DataFrame":
-        coord_rows = (
-            df[["lat", "lon", "elev", "igbp"]]
-            .drop_duplicates(subset=["lat", "lon"])
-            .reset_index(drop=True)
-        )
+    def coord_ids_for_arrays(
+        self,
+        lat: np.ndarray,
+        lon: np.ndarray,
+        elev: np.ndarray,
+        igbp: str | None = None,
+    ) -> np.ndarray:
+        coord_ids = np.empty(len(lat), dtype=np.int64)
         inserts = []
-        for row in coord_rows.itertuples(index=False):
-            key = rounded_coord_key(row.lat, row.lon)
-            if key in self.coord_lookup:
-                continue
-            coord_id = self.next_coord_id
-            self.next_coord_id += 1
-            self.coord_lookup[key] = coord_id
-            inserts.append((coord_id, float(row.lat), float(row.lon), nullable_float(row.elev), row.igbp))
+        for index, (row_lat, row_lon, row_elev) in enumerate(zip(lat, lon, elev, strict=True)):
+            key = rounded_coord_key(row_lat, row_lon)
+            coord_id = self.coord_lookup.get(key)
+            if coord_id is None:
+                coord_id = self.next_coord_id
+                self.next_coord_id += 1
+                self.coord_lookup[key] = coord_id
+                inserts.append(
+                    (
+                        coord_id,
+                        float(row_lat),
+                        float(row_lon),
+                        nullable_float(row_elev),
+                        igbp,
+                    )
+                )
+            coord_ids[index] = coord_id
         if inserts:
             self.conn.executemany(
                 """
@@ -1038,9 +983,7 @@ class Era5DatabaseWriter:
                 """,
                 inserts,
             )
-        keys = pd.MultiIndex.from_frame(df[["lat", "lon"]].round(6))
-        df["coord_id"] = keys.map(self.coord_lookup).astype("int64")
-        return df
+        return coord_ids
 
     def insert_ec_data(self, df: "pd.DataFrame") -> int:
         for predictor in EC_PREDICTORS:
@@ -1073,11 +1016,18 @@ class Era5GroupGrid:
     lon: np.ndarray
     land_indices: np.ndarray
     spatial_shape: tuple[int, int]
+    fallback_offsets: np.ndarray
+    timezone_groups: tuple[tuple[str, np.ndarray], ...]
+    coord_id: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
 class Era5TimeBlock:
     variables: dict[str, np.ndarray]
+    timestamp: np.ndarray
+    local_timestamp: np.ndarray
+    doy: np.ndarray
+    tod: np.ndarray
     length: int
 
 
@@ -1089,11 +1039,18 @@ class Era5PostProcessor:
         self.batch_size = int(process_config.get("batch_size", 50_000))
         time_block_size = process_config.get("time_block_size")
         self.time_block_size = int(time_block_size) if time_block_size else None
+        self.insert_hours_per_batch = max(
+            1,
+            int(process_config.get("insert_hours_per_batch", 4)),
+        )
         self.xarray_engine = process_config.get("xarray_engine")
         self.timezone_resolver = TimezoneResolver(config)
         self.land_mask = LandSeaMask(config)
         self.writer = Era5DatabaseWriter(conn, self.batch_size)
         self.local_window = self.parse_local_window()
+        self.local_window_int = tuple(
+            self.timestamp_bound_to_int(bound) for bound in self.local_window
+        )
 
     def parse_local_window(self) -> tuple["pd.Timestamp | None", "pd.Timestamp | None"]:
         timezone_config = section(section(self.config, "process_era5"), "timezone")
@@ -1104,6 +1061,15 @@ class Era5PostProcessor:
         start = pd.Timestamp(window_config.get("start") or date_range.local_window_start)
         end = pd.Timestamp(window_config.get("end") or date_range.local_window_end)
         return start, end
+
+    @staticmethod
+    def timestamp_bound_to_int(timestamp: "pd.Timestamp | None") -> int | None:
+        if timestamp is None:
+            return None
+        ts = pd.Timestamp(timestamp)
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert("UTC").tz_localize(None)
+        return int(ts.strftime("%Y%m%d%H%M%S"))
 
     def process_groups(self, netcdf_dir: Path, limit_groups: int | None = None) -> int:
         group_dirs = list(iter_netcdf_group_dirs(netcdf_dir))
@@ -1153,12 +1119,39 @@ class Era5PostProcessor:
             group_grid = self.prepare_group_grid(ds)
             valid_times = pd.to_datetime(ds["valid_time"].values)
             time_block_size = self.infer_time_block_size(ds, len(valid_times))
+            pending_frames: list[pd.DataFrame] = []
+
+            def flush_pending_frames() -> None:
+                nonlocal inserted
+                if not pending_frames:
+                    return
+                if len(pending_frames) == 1:
+                    batch = pending_frames[0]
+                else:
+                    batch = pd.concat(pending_frames, ignore_index=True, copy=False)
+                inserted += self.writer.insert_ec_data(batch)
+                pending_frames.clear()
+
             for block_start in range(0, len(valid_times), time_block_size):
                 block_end = min(block_start + time_block_size, len(valid_times))
-                block = self.land_block_from_dataset(ds, group_grid, block_start, block_end)
-                for block_offset, valid_time in enumerate(valid_times[block_start:block_end]):
+                block = self.land_block_from_dataset(
+                    ds,
+                    group_grid,
+                    valid_times[block_start:block_end],
+                    block_start,
+                    block_end,
+                )
+                if group_grid.coord_id is None:
+                    group_grid = self.prepare_group_coord_ids(group_grid, block, valid_times)
+                for block_offset in range(block.length):
                     frame = self.land_frame_from_block(group_grid, block, block_offset)
-                    inserted += self.process_land_frame(frame, pd.Timestamp(valid_time))
+                    frame = self.prepare_land_frame(frame)
+                    if frame.empty:
+                        continue
+                    pending_frames.append(frame)
+                    if len(pending_frames) >= self.insert_hours_per_batch:
+                        flush_pending_frames()
+            flush_pending_frames()
             self.conn.commit()
             return inserted
         finally:
@@ -1176,12 +1169,100 @@ class Era5PostProcessor:
         coord_frame = pd.DataFrame({"lat": lat_flat, "lon": lon_flat})
         land_frame = self.land_mask.filter(coord_frame)
         land_indices = land_frame.index.to_numpy(dtype=np.int64)
+        land_lat = lat_flat[land_indices]
+        land_lon = lon_flat[land_indices]
         return Era5GroupGrid(
-            lat=lat_flat[land_indices],
-            lon=lon_flat[land_indices],
+            lat=land_lat,
+            lon=land_lon,
             land_indices=land_indices,
             spatial_shape=(len(lats), len(lons)),
+            fallback_offsets=self.timezone_resolver.fallback_offsets_for_longitudes(land_lon),
+            timezone_groups=self.timezone_groups_for_coordinates(land_lat, land_lon),
         )
+
+    def timezone_groups_for_coordinates(
+        self,
+        lat: np.ndarray,
+        lon: np.ndarray,
+    ) -> tuple[tuple[str, np.ndarray], ...]:
+        if not self.timezone_resolver.enabled:
+            return ()
+        grouped: dict[str, list[int]] = {}
+        for index, (row_lat, row_lon) in enumerate(zip(lat, lon, strict=True)):
+            zone_name = self.timezone_resolver.zone_for_coordinate(float(row_lat), float(row_lon))
+            if zone_name is None:
+                continue
+            grouped.setdefault(zone_name, []).append(index)
+        return tuple(
+            (zone_name, np.asarray(indices, dtype=np.int64))
+            for zone_name, indices in grouped.items()
+        )
+
+    def prepare_group_coord_ids(
+        self,
+        group_grid: Era5GroupGrid,
+        block: Era5TimeBlock,
+        valid_times: Iterable["pd.Timestamp"],
+    ) -> Era5GroupGrid:
+        if "geopotential" in block.variables:
+            elev = block.variables["geopotential"][0] / GRAVITATIONAL_ACC
+        else:
+            elev = np.full(len(group_grid.lat), np.nan, dtype=float)
+        coord_id = np.full(len(group_grid.lat), -1, dtype=np.int64)
+        insert_order = self.coord_insert_order_for_times(group_grid, valid_times)
+        ordered_coord_ids = self.writer.coord_ids_for_arrays(
+            group_grid.lat[insert_order],
+            group_grid.lon[insert_order],
+            elev[insert_order],
+        )
+        coord_id[insert_order] = ordered_coord_ids
+        return replace(group_grid, coord_id=coord_id)
+
+    def coord_insert_order_for_times(
+        self,
+        group_grid: Era5GroupGrid,
+        valid_times: Iterable["pd.Timestamp"],
+    ) -> np.ndarray:
+        point_count = len(group_grid.lat)
+        start, end = self.local_window_int
+        if start is None and end is None:
+            return np.arange(point_count, dtype=np.int64)
+
+        first_seen = np.full(point_count, -1, dtype=np.int32)
+        valid_time_list = [pd.Timestamp(valid_time) for valid_time in valid_times]
+        for time_index, utc_ts in enumerate(valid_time_list):
+            if utc_ts.tzinfo is None:
+                utc_ts = utc_ts.tz_localize("UTC")
+            else:
+                utc_ts = utc_ts.tz_convert("UTC")
+            utc_dt = utc_ts.to_pydatetime()
+            utc_naive = utc_ts.tz_localize(None)
+            offset_minutes = (
+                self.offset_minutes_for_group_grid(group_grid, utc_dt)
+                if self.timezone_resolver.enabled
+                else np.zeros(point_count, dtype=np.int32)
+            )
+            keep = np.zeros(point_count, dtype=bool)
+            for offset in np.unique(offset_minutes):
+                local_ts = utc_naive + pd.Timedelta(minutes=int(offset))
+                local_timestamp_value = int(local_ts.strftime("%Y%m%d%H%M%S"))
+                if start is not None and local_timestamp_value < start:
+                    continue
+                if end is not None and local_timestamp_value > end:
+                    continue
+                keep |= offset_minutes == offset
+            newly_seen = keep & (first_seen < 0)
+            first_seen[newly_seen] = time_index
+            if np.all(first_seen >= 0):
+                break
+
+        ordered_indices = [
+            np.flatnonzero(first_seen == time_index)
+            for time_index in range(len(valid_time_list))
+        ]
+        if not ordered_indices:
+            return np.array([], dtype=np.int64)
+        return np.concatenate(ordered_indices).astype(np.int64, copy=False)
 
     def infer_time_block_size(self, ds, valid_time_count: int) -> int:
         if self.time_block_size is not None:
@@ -1203,6 +1284,7 @@ class Era5PostProcessor:
         self,
         ds,
         group_grid: Era5GroupGrid,
+        valid_times: Iterable["pd.Timestamp"],
         block_start: int,
         block_end: int,
     ) -> Era5TimeBlock:
@@ -1248,7 +1330,80 @@ class Era5PostProcessor:
                     land_values,
                     (block_length, len(group_grid.land_indices)),
                 )
-        return Era5TimeBlock(variables=variables, length=block_length)
+        timestamp, local_timestamp, doy, tod = self.time_fields_for_block(
+            group_grid,
+            valid_times,
+        )
+        return Era5TimeBlock(
+            variables=variables,
+            timestamp=timestamp,
+            local_timestamp=local_timestamp,
+            doy=doy,
+            tod=tod,
+            length=block_length,
+        )
+
+    def time_fields_for_block(
+        self,
+        group_grid: Era5GroupGrid,
+        valid_times: Iterable["pd.Timestamp"],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        valid_time_list = [pd.Timestamp(valid_time) for valid_time in valid_times]
+        block_length = len(valid_time_list)
+        point_count = len(group_grid.land_indices)
+        timestamp = np.empty((block_length, point_count), dtype=np.int64)
+        local_timestamp = np.empty((block_length, point_count), dtype=np.int64)
+        doy = np.empty((block_length, point_count), dtype=float)
+        tod = np.empty((block_length, point_count), dtype=float)
+
+        for time_index, utc_ts in enumerate(valid_time_list):
+            if utc_ts.tzinfo is None:
+                utc_ts = utc_ts.tz_localize("UTC")
+            else:
+                utc_ts = utc_ts.tz_convert("UTC")
+            utc_dt = utc_ts.to_pydatetime()
+            utc_naive = utc_ts.tz_localize(None)
+            utc_timestamp = int(utc_naive.strftime("%Y%m%d%H%M%S"))
+
+            if self.timezone_resolver.enabled:
+                offset_minutes = self.offset_minutes_for_group_grid(group_grid, utc_dt)
+            else:
+                offset_minutes = np.zeros(point_count, dtype=np.int32)
+
+            for offset in np.unique(offset_minutes):
+                offset_mask = offset_minutes == offset
+                local_ts = utc_naive + pd.Timedelta(minutes=int(offset))
+                local_timestamp_value = int(local_ts.strftime("%Y%m%d%H%M%S"))
+                tod_value = (
+                    float(local_ts.hour)
+                    + float(local_ts.minute) / 60.0
+                    + float(local_ts.second) / 3600.0
+                    + 1.0
+                )
+                if tod_value > 24.0:
+                    tod_value -= 24.0
+                local_timestamp[time_index, offset_mask] = local_timestamp_value
+                doy[time_index, offset_mask] = float(local_ts.dayofyear)
+                tod[time_index, offset_mask] = tod_value
+
+            if self.timezone_resolver.timestamp_policy == "local":
+                timestamp[time_index] = local_timestamp[time_index]
+            else:
+                timestamp[time_index].fill(utc_timestamp)
+
+        return timestamp, local_timestamp, doy, tod
+
+    def offset_minutes_for_group_grid(
+        self,
+        group_grid: Era5GroupGrid,
+        utc_dt: datetime,
+    ) -> np.ndarray:
+        offsets = group_grid.fallback_offsets.copy()
+        for zone_name, indices in group_grid.timezone_groups:
+            zone_offset = self.timezone_resolver.offset_for_named_zone(zone_name, utc_dt)
+            if zone_offset is not None:
+                offsets[indices] = zone_offset
+        return offsets
 
     def land_frame_from_block(
         self,
@@ -1256,28 +1411,29 @@ class Era5PostProcessor:
         block: Era5TimeBlock,
         block_offset: int,
     ) -> "pd.DataFrame":
-        data: dict[str, np.ndarray] = {
-            "lat": group_grid.lat,
-            "lon": group_grid.lon,
-        }
+        if group_grid.coord_id is None:
+            raise RuntimeError("ERA5 group coord_id values were not prepared before frame creation.")
         if block_offset < 0 or block_offset >= block.length:
             raise IndexError(f"Block offset {block_offset} is outside block length {block.length}.")
+        data: dict[str, np.ndarray] = {
+            "coord_id": group_grid.coord_id,
+            "timestamp": block.timestamp[block_offset],
+            "_local_timestamp": block.local_timestamp[block_offset],
+            "DOY": block.doy[block_offset],
+            "TOD": block.tod[block_offset],
+        }
         for name, values in block.variables.items():
             data[name] = values[block_offset]
         return pd.DataFrame(data, copy=False)
 
-    def process_land_frame(self, df: "pd.DataFrame", utc_timestamp: "pd.Timestamp") -> int:
+    def prepare_land_frame(self, df: "pd.DataFrame") -> "pd.DataFrame":
         if df.empty:
-            return 0
-        df = self.add_predictors(df)
-        df["igbp"] = None
-        df = self.timezone_resolver.localize_frame(df, utc_timestamp)
+            return df
         df = self.apply_local_window(df)
         if df.empty:
-            return 0
-        df = minmax_normalization(df)
-        df = self.writer.assign_coord_ids(df)
-        return self.writer.insert_ec_data(df)
+            return df
+        df = self.add_predictors(df)
+        return minmax_normalization(df)
 
     def add_predictors(self, df: "pd.DataFrame") -> "pd.DataFrame":
         for predictor in [*EC_PREDICTORS, "ELEVATION"]:
@@ -1301,17 +1457,15 @@ class Era5PostProcessor:
         return df
 
     def apply_local_window(self, df: "pd.DataFrame") -> "pd.DataFrame":
-        start, end = self.local_window
+        start, end = self.local_window_int
         if start is None and end is None:
             return df
-        timestamp_source = "_local_timestamp" if "_local_timestamp" in df.columns else "timestamp"
-        timestamp_text = df[timestamp_source].astype("int64").astype(str)
-        local_dt = pd.to_datetime(timestamp_text, format="%Y%m%d%H%M%S")
-        keep = pd.Series(True, index=df.index)
+        local_timestamp = df["_local_timestamp"].to_numpy(dtype=np.int64)
+        keep = np.ones(len(df), dtype=bool)
         if start is not None:
-            keep &= local_dt >= start
+            keep &= local_timestamp >= start
         if end is not None:
-            keep &= local_dt <= end
+            keep &= local_timestamp <= end
         return df.loc[keep].copy()
 
 

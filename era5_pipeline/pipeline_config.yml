@@ -1,6 +1,6 @@
 pipeline:
   steps:
-    - download_era5
+    # - download_era5
     - process_era5
     # - index_era5
     # - download_modis
@@ -11,6 +11,8 @@ pipeline:
 
 start_date: "2016-01-01"
 end_date: "2017-12-31"
+# start_date: "2014-01-01"
+# end_date: "2015-12-31"
 
 paths:
   data_root: /home/l/luislara/links/projects/aip-pal/luislara/ep/data
@@ -53,7 +55,8 @@ download_era5:
 
 process_era5:
   recreate_db: true
-  batch_size: 50000
+  batch_size: 100000
+  insert_hours_per_batch: 24
   xarray_engine: h5netcdf
   sqlite_threads: 8
 
