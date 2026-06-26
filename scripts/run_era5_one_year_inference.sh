@@ -7,9 +7,9 @@ usage() {
   echo "Example: $0 2017" >&2
 }
 
-YEAR="${YEAR:-}"
+YEAR="${YEAR:-2017}"
 MODE="${MODE:-parallel}"
-POST_FORMAT="${POST_FORMAT:-csv}"
+POST_FORMAT="${POST_FORMAT:-netcdf}"
 DRY_RUN="${DRY_RUN:-0}"
 RUN_PATH="${RUN_PATH:-experiments/runs/final_v2_3e-06_ws_l128_f12_e32_c32_o0.3_wcswcswcswcsssss_CC/seed_0}"
 LOG_DIR="${LOG_DIR:-/scratch/l/luislara/EcoPerceiver/logs}"

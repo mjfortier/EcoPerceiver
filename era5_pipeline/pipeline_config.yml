@@ -1,11 +1,11 @@
 pipeline:
   steps:
     # - download_era5
-    - process_era5
-    # - index_era5
+    # - process_era5
     # - download_modis
-    # - assign_igbp_from_modis
-    # - process_modis
+    - index_era5
+    - assign_igbp_from_modis
+    - process_modis
   dry_run: false
   python: null
 
@@ -86,7 +86,7 @@ index_era5:
     - id
   journal_mode: DELETE
   skip_preflight: false
-  progress: auto
+  progress: none
   threads: 8
   analyze: true
   dry_run: false

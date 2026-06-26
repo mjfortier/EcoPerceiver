@@ -23,8 +23,8 @@ DEFAULT_DB_PATH = Path("experiments/data/era5.db")
 DEFAULT_TABLE = "ec_data"
 DEFAULT_INDEX_NAME = "idx_ec_data_coord_id_timestamp_id"
 DEFAULT_INDEX_COLUMNS = ("coord_id", "timestamp", "id")
-SQLITE_PROGRESS_OPCODES = 100_000
-HEARTBEAT_SECONDS = 15.0
+SQLITE_PROGRESS_OPCODES = 10_000_000
+HEARTBEAT_SECONDS = 60.0
 PROGRESS_STATUS_SECONDS = 2.0
 SQLITE_TIMEOUT_SECONDS = 60.0
 ESTIMATED_INDEX_BYTES_PER_ROW = 32.0
@@ -235,6 +235,13 @@ def sqlite_progress(
         temp_dir=temp_dir,
         progress_mode=progress_mode,
     )
+    if progress.progress_mode == "none":
+        try:
+            yield
+        finally:
+            progress.close()
+        return
+
     conn.set_progress_handler(progress.update, SQLITE_PROGRESS_OPCODES)
     try:
         yield
