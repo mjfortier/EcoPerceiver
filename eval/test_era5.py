@@ -74,7 +74,7 @@ def parse_requested_prediction_targets(values: list[str] | None) -> tuple[str, .
 
     requested = []
     for value in values:
-        requested.extend(item.strip() for item in value.split(",") if item.strip())
+        requested.extend(value.replace(",", " ").split())
 
     requested = list(dict.fromkeys(requested))
     if not requested:

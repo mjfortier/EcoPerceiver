@@ -135,10 +135,7 @@ def parse_prediction_targets(values: list[str] | None) -> tuple[str, ...] | None
 
     prediction_targets = []
     for value in values:
-        for raw_target in value.split(","):
-            target = raw_target.strip()
-            if not target:
-                continue
+        for target in value.replace(",", " ").split():
             if not target.startswith("pred_"):
                 target = f"pred_{target}"
             prediction_targets.append(target)

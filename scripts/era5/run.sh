@@ -4,10 +4,10 @@
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=32
 #SBATCH --time=1:00:00
-#SBATCH --output=/scratch/l/luislara/EcoPerceiver/logs/eval_era5_single.out
-#SBATCH --error=/scratch/l/luislara/EcoPerceiver/logs/eval_era5_single.error
+#SBATCH --output=/scratch/l/luislara/EcoPerceiver/logs/run.out
+#SBATCH --error=/scratch/l/luislara/EcoPerceiver/logs/run.error
 #SBATCH --open-mode=truncate
-#SBATCH --job-name=eval-era5
+#SBATCH --job-name=run
 #SBATCH --account=aip-pal
 
 set -euo pipefail
@@ -16,9 +16,9 @@ source $SCRATCH/env/ecoperceiver/bin/activate
 cd ~/links/scratch/EcoPerceiver
 
 export PYTHONUNBUFFERED=1
-echo "[$(date)] Starting eval-era5 job ${SLURM_JOB_ID:-local} on ${SLURM_JOB_NODELIST:-local}"
-echo "stdout: /scratch/l/luislara/EcoPerceiver/logs/eval_era5_single.out"
-echo "stderr: /scratch/l/luislara/EcoPerceiver/logs/eval_era5_single.error"
+echo "[$(date)] Starting single-process inference job ${SLURM_JOB_ID:-local} on ${SLURM_JOB_NODELIST:-local}"
+echo "stdout: /scratch/l/luislara/EcoPerceiver/logs/run.out"
+echo "stderr: /scratch/l/luislara/EcoPerceiver/logs/run.error"
 
 RUN_PATH="experiments/runs/final_v2_3e-06_ws_l128_f12_e32_c32_o0.3_wcswcswcswcsssss_CC/seed_0"
 DB_PATH="/home/l/luislara/links/projects/aip-pal/luislara/ep/data/era5.db"
