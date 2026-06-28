@@ -4,9 +4,9 @@
 #SBATCH --mem=128G
 #SBATCH --cpus-per-task=8
 #SBATCH --time=24:00:00
-#SBATCH --output=/home/l/luislara/links/scratch/EcoPerceiver/era5_pipeline/logs/pipeline_%j.out
-#SBATCH --error=/home/l/luislara/links/scratch/EcoPerceiver/era5_pipeline/logs/pipeline_%j.error
-#SBATCH --job-name=era5-pipeline
+#SBATCH --output=/home/l/luislara/links/scratch/EcoPerceiver/era5_pipeline/logs/pipeline_%j_3.out
+#SBATCH --error=/home/l/luislara/links/scratch/EcoPerceiver/era5_pipeline/logs/pipeline_%j_3.error
+#SBATCH --job-name=era5-pipeline3
 #SBATCH --account=aip-pal
 
 set -euo pipefail

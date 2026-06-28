@@ -6,8 +6,9 @@ ERA5 single-level variables, unzip NetCDF chunks, convert ERA5 short names
 to predictor variables, then write ``coord_data`` and ``ec_data`` tables.
 
 The post-processing deliberately computes local time with minute-precision
-UTC offsets. This avoids the India/Australia bug caused by assuming every
-time-zone offset is a whole number of hours.
+UTC offsets for cyclic time features. Local-policy row timestamps are rounded
+onto an hourly grid by default, because downstream ERA5 lookup and cube output
+expect every coordinate to share hourly timestamp values.
 """
 
 from __future__ import annotations
@@ -802,6 +803,11 @@ class TimezoneResolver:
         self.timestamp_policy = str(timezone_config.get("timestamp_policy", "local")).lower()
         self.method = str(timezone_config.get("method", "timezonefinder")).lower()
         self.fallback = str(timezone_config.get("fallback", "longitude_quarter_hour")).lower()
+        self.timestamp_grid = str(timezone_config.get("timestamp_grid", "hourly")).lower()
+        if self.timestamp_grid not in {"hourly", "exact"}:
+            raise SystemExit(
+                "process_era5.timezone.timestamp_grid must be 'hourly' or 'exact'."
+            )
         self.require_timezonefinder = bool(timezone_config.get("require_timezonefinder", True))
         self.zone_cache: dict[tuple[float, float], str | None] = {}
         self.zone_offset_cache: dict[tuple[str, datetime], int | None] = {}
@@ -1071,6 +1077,11 @@ class Era5PostProcessor:
             ts = ts.tz_convert("UTC").tz_localize(None)
         return int(ts.strftime("%Y%m%d%H%M%S"))
 
+    def timestamp_for_local_grid(self, local_ts: "pd.Timestamp") -> "pd.Timestamp":
+        if self.timezone_resolver.timestamp_grid == "exact":
+            return local_ts
+        return (local_ts + pd.Timedelta(minutes=30)).floor("h")
+
     def process_groups(self, netcdf_dir: Path, limit_groups: int | None = None) -> int:
         group_dirs = list(iter_netcdf_group_dirs(netcdf_dir))
         if limit_groups is not None:
@@ -1245,7 +1256,8 @@ class Era5PostProcessor:
             keep = np.zeros(point_count, dtype=bool)
             for offset in np.unique(offset_minutes):
                 local_ts = utc_naive + pd.Timedelta(minutes=int(offset))
-                local_timestamp_value = int(local_ts.strftime("%Y%m%d%H%M%S"))
+                timestamp_ts = self.timestamp_for_local_grid(local_ts)
+                local_timestamp_value = int(timestamp_ts.strftime("%Y%m%d%H%M%S"))
                 if start is not None and local_timestamp_value < start:
                     continue
                 if end is not None and local_timestamp_value > end:
@@ -1373,7 +1385,8 @@ class Era5PostProcessor:
             for offset in np.unique(offset_minutes):
                 offset_mask = offset_minutes == offset
                 local_ts = utc_naive + pd.Timedelta(minutes=int(offset))
-                local_timestamp_value = int(local_ts.strftime("%Y%m%d%H%M%S"))
+                timestamp_ts = self.timestamp_for_local_grid(local_ts)
+                local_timestamp_value = int(timestamp_ts.strftime("%Y%m%d%H%M%S"))
                 tod_value = (
                     float(local_ts.hour)
                     + float(local_ts.minute) / 60.0

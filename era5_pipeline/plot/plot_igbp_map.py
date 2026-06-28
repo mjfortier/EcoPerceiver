@@ -29,7 +29,7 @@ except ModuleNotFoundError as exc:
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = Path("/home/l/luislara/links/projects/aip-pal/luislara/ep/data/2016_2017/era5_2016_2017.db")
-DEFAULT_OUTPUT_PATH = SCRIPT_DIR / "igbp_coord_map.png"
+DEFAULT_OUTPUT_PATH = SCRIPT_DIR / "tmp" / "igbp_coord_map.png"
 DEFAULT_TABLE = "coord_data"
 DEFAULT_COASTLINE_CACHE = (
     Path.home() / ".cache" / "ecoperceiver" / "ne_110m_admin_0_countries.geojson"

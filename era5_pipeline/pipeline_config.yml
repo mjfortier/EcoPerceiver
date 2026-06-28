@@ -1,18 +1,20 @@
 pipeline:
   steps:
-    # - download_era5
+    - download_era5
     # - process_era5
     # - download_modis
-    - index_era5
-    - assign_igbp_from_modis
-    - process_modis
+    # - index_era5
+    # - assign_igbp_from_modis
+    # - process_modis
   dry_run: false
   python: null
 
-start_date: "2016-01-01"
-end_date: "2017-12-31"
+# start_date: "2016-01-01"
+# end_date: "2017-12-31"
 # start_date: "2014-01-01"
 # end_date: "2015-12-31"
+start_date: "2012-01-01"
+end_date: "2013-12-31"
 
 paths:
   data_root: /home/l/luislara/links/projects/aip-pal/luislara/ep/data
@@ -62,9 +64,10 @@ process_era5:
 
   timezone:
     enabled: true
-    # "local" stores wall-clock timestamps per coordinate. Half-hour offsets
-    # produce timestamps such as YYYYMMDDHH3000.
+    # "local" stores wall-clock timestamps per coordinate. The hourly grid keeps
+    # all coordinates on YYYYMMDDHH0000 values while TOD/DOY use exact offsets.
     timestamp_policy: local
+    timestamp_grid: hourly
     method: timezonefinder
     require_timezonefinder: true
     fallback: longitude_quarter_hour

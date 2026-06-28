@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import os
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,13 @@ DEFAULT_CONFIG_PATH = SCRIPT_DIR / "pipeline_config.yml"
 DEFAULT_STEPS = (
     "download_era5",
     "process_era5",
+)
+TIMED_STEPS = frozenset(
+    (
+        "index_era5",
+        "assign_igbp_from_modis",
+        "process_modis",
+    )
 )
 
 
@@ -667,6 +676,46 @@ def run_command(command: list[str], dry_run: bool) -> None:
     subprocess.run(command, cwd=REPO_ROOT, env=env, check=True)
 
 
+def timestamp_now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def format_elapsed(seconds: float) -> str:
+    total_seconds = int(round(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def run_step(step: str, args: argparse.Namespace) -> float | None:
+    timed = step in TIMED_STEPS and not args.dry_run
+    if not timed:
+        run_command(command_for_step(step, args), dry_run=args.dry_run)
+        return None
+
+    started_at = timestamp_now()
+    start_time = time.monotonic()
+    print(f"[timing] {step} started_at={started_at}", flush=True)
+    try:
+        run_command(command_for_step(step, args), dry_run=False)
+    except BaseException:
+        elapsed = time.monotonic() - start_time
+        print(
+            f"[timing] {step} failed_at={timestamp_now()} "
+            f"elapsed={format_elapsed(elapsed)}",
+            flush=True,
+        )
+        raise
+
+    elapsed = time.monotonic() - start_time
+    print(
+        f"[timing] {step} finished_at={timestamp_now()} "
+        f"elapsed={format_elapsed(elapsed)}",
+        flush=True,
+    )
+    return elapsed
+
+
 def main() -> int:
     args = parse_args()
     if args.list_steps:
@@ -676,9 +725,19 @@ def main() -> int:
     steps = list(args.steps)
     print(f"Config: {args.config_path}")
     print(f"Selected pipeline steps: {' '.join(steps)}")
+    timed_step_elapsed: list[tuple[str, float]] = []
     for step in steps:
         print(f"\n==> {step}: {STEPS[step].description}", flush=True)
-        run_command(command_for_step(step, args), dry_run=args.dry_run)
+        elapsed = run_step(step, args)
+        if elapsed is not None:
+            timed_step_elapsed.append((step, elapsed))
+
+    if timed_step_elapsed:
+        print("\nPipeline timing summary:", flush=True)
+        for step, elapsed in timed_step_elapsed:
+            print(f"  {step}: {format_elapsed(elapsed)}", flush=True)
+        total_elapsed = sum(elapsed for _step, elapsed in timed_step_elapsed)
+        print(f"  timed_steps_total: {format_elapsed(total_elapsed)}", flush=True)
 
     if args.dry_run:
         print("\nDry run only; no pipeline commands were executed.")
