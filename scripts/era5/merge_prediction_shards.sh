@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --nodes=1
-#SBATCH --mem=64G
+#SBATCH --mem=256G
 #SBATCH --cpus-per-task=4
 #SBATCH --time=12:00:00
 #SBATCH --output=/scratch/l/luislara/EcoPerceiver/logs/merge_prediction_shards.out
@@ -30,11 +30,11 @@ append_prediction_targets() {
   done
 }
 
-POST_FORMAT="${POST_FORMAT:-csv}"
+POST_FORMAT="${POST_FORMAT:-netcdf}"
 SORT_OUTPUT="${SORT_OUTPUT:-1}"
 NUM_SHARDS="${NUM_SHARDS:-4}"
-NETCDF_DUPLICATE_POLICY="${NETCDF_DUPLICATE_POLICY:-error}"
-PREDICTION_TARGETS_ENV="${PREDICTION_TARGETS:-}"
+NETCDF_DUPLICATE_POLICY="${NETCDF_DUPLICATE_POLICY:-last}"
+PREDICTION_TARGETS_ENV="${PREDICTION_TARGETS:-pred_GPP_DT pred_RECO_DT pred_FCH4 pred_LE}"
 PREDICTION_TARGET_LIST=()
 if [[ -n "$PREDICTION_TARGETS_ENV" ]]; then
   append_prediction_targets "$PREDICTION_TARGETS_ENV"
@@ -182,7 +182,7 @@ echo "Sort output: $SORT_LABEL"
 echo "NetCDF duplicate policy: $NETCDF_DUPLICATE_POLICY"
 echo "Temporary shard order key: __sample_order (dropped from final output when present)"
 
-python3 -u eval/merge_era5_shards.py \
+python3 -u eval/era5/merge_era5_shards.py \
   --format "$POST_FORMAT" \
   --shard-dir "$SHARD_DIR" \
   --output-path "$OUTPUT_PATH" \

@@ -31,7 +31,7 @@ PREDICTION_TARGETS=(pred_GPP_DT pred_RECO_DT pred_FCH4 pred_LE)
 
 echo "Output CSV: $OUTPUT_CSV"
 
-python3 -u eval/test_era5.py \
+python3 -u eval/era5/test_era5.py \
   --run-path "$RUN_PATH" \
   --checkpoint-path checkpoint-11.pth \
   --db-path "$DB_PATH" \

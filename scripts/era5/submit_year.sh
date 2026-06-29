@@ -2,6 +2,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$REPO_ROOT"
+
 usage() {
   cat >&2 <<EOF
 Usage: $0 YEAR [--parallel|--sequential] [--post-format csv|netcdf] [options]
@@ -44,6 +48,31 @@ append_prediction_targets() {
   done
 }
 
+append_merge_prediction_targets() {
+  local raw value
+  raw="${1//,/ }"
+  for value in $raw; do
+    if [[ -n "$value" ]]; then
+      MERGE_PREDICTION_TARGET_LIST+=("$value")
+    fi
+  done
+}
+
+resolve_checkpoint_path_for_check() {
+  local checkpoint_path="$1"
+  case "$checkpoint_path" in
+    /*)
+      echo "$checkpoint_path"
+      ;;
+    "~"|"~/"*)
+      echo "${checkpoint_path/#\~/$HOME}"
+      ;;
+    *)
+      echo "$RUN_PATH/$checkpoint_path"
+      ;;
+  esac
+}
+
 YEAR="${YEAR:-}"
 MODE="${MODE:-parallel}"
 POST_FORMAT="${POST_FORMAT:-netcdf}"
@@ -59,6 +88,9 @@ DB_LABEL="${DB_LABEL:-}"
 PREDICTION_TARGETS_ENV="${PREDICTION_TARGETS:-pred_NEE pred_GPP_DT pred_RECO_DT pred_FCH4 pred_LE}"
 PREDICTION_TARGET_LIST=()
 append_prediction_targets "$PREDICTION_TARGETS_ENV"
+MERGE_PREDICTION_TARGETS_ENV="${MERGE_PREDICTION_TARGETS:-pred_GPP_DT pred_RECO_DT pred_FCH4 pred_LE}"
+MERGE_PREDICTION_TARGET_LIST=()
+append_merge_prediction_targets "$MERGE_PREDICTION_TARGETS_ENV"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -230,13 +262,47 @@ if [[ "$CHECK_DB" != "0" && ! -f "$DB_PATH" ]]; then
   fi
 fi
 
+if [[ "$DRY_RUN" != "1" ]]; then
+  command -v sbatch >/dev/null || {
+    echo "sbatch not found in PATH; cannot submit ERA5 jobs." >&2
+    exit 2
+  }
+  [[ -f scripts/era5/run_multi_gpu.sh ]] || {
+    echo "Child job script not found: scripts/era5/run_multi_gpu.sh" >&2
+    exit 2
+  }
+  [[ -n "${SCRATCH:-}" ]] || {
+    echo "SCRATCH is not set; scripts/era5/run_multi_gpu.sh needs it to activate the environment." >&2
+    exit 2
+  }
+  [[ -f "$SCRATCH/env/ecoperceiver/bin/activate" ]] || {
+    echo "EcoPerceiver environment activation script not found: $SCRATCH/env/ecoperceiver/bin/activate" >&2
+    exit 2
+  }
+  [[ -d "$RUN_PATH" ]] || {
+    echo "Run path not found: $RUN_PATH" >&2
+    exit 2
+  }
+  [[ -n "$CHECKPOINT_PATH" ]] || {
+    echo "CHECKPOINT_PATH must not be empty." >&2
+    exit 2
+  }
+  checkpoint_path_for_check="$(resolve_checkpoint_path_for_check "$CHECKPOINT_PATH")"
+  [[ -f "$checkpoint_path_for_check" ]] || {
+    echo "Checkpoint not found: $checkpoint_path_for_check" >&2
+    exit 2
+  }
+fi
+
 mkdir -p "$LOG_DIR"
 
 starts=("${YEAR}-01-01" "${YEAR}-04-01" "${YEAR}-07-01" "${YEAR}-10-01")
 ends=("${YEAR}-03-31" "${YEAR}-06-30" "${YEAR}-09-30" "${YEAR}-12-31")
 
 PREDICTION_TARGETS_VALUE="${PREDICTION_TARGET_LIST[*]}"
+MERGE_PREDICTION_TARGETS_VALUE="${MERGE_PREDICTION_TARGET_LIST[*]}"
 export PREDICTION_TARGETS="$PREDICTION_TARGETS_VALUE"
+export MERGE_PREDICTION_TARGETS="$MERGE_PREDICTION_TARGETS_VALUE"
 export CHECKPOINT_PATH
 
 previous_dependency_id=""
@@ -246,7 +312,8 @@ echo "DB path: $DB_PATH"
 echo "Run path: $RUN_PATH"
 echo "Checkpoint path: $CHECKPOINT_PATH"
 echo "Post format: $POST_FORMAT"
-echo "Prediction targets: $PREDICTION_TARGETS_VALUE"
+echo "Inference prediction targets: $PREDICTION_TARGETS_VALUE"
+echo "Merge prediction targets: $MERGE_PREDICTION_TARGETS_VALUE"
 
 for chunk_index in "${!starts[@]}"; do
   initial_date="${starts[$chunk_index]}"
@@ -272,7 +339,7 @@ for chunk_index in "${!starts[@]}"; do
   fi
 
   if [[ "$DRY_RUN" == "1" ]]; then
-    printf 'DRY RUN: PREDICTION_TARGETS=%q CHECKPOINT_PATH=%q sbatch' "$PREDICTION_TARGETS" "$CHECKPOINT_PATH"
+    printf 'DRY RUN: PREDICTION_TARGETS=%q MERGE_PREDICTION_TARGETS=%q CHECKPOINT_PATH=%q sbatch' "$PREDICTION_TARGETS" "$MERGE_PREDICTION_TARGETS" "$CHECKPOINT_PATH"
     printf ' %q' "${sbatch_args[@]}" scripts/era5/run_multi_gpu.sh
     printf '\n'
     job_id="dryrun-$((chunk_index + 1))"

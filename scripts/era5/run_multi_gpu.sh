@@ -28,6 +28,16 @@ append_prediction_targets() {
   done
 }
 
+append_merge_prediction_targets() {
+  local raw value
+  raw="${1//,/ }"
+  for value in $raw; do
+    if [[ -n "$value" ]]; then
+      MERGE_PREDICTION_TARGET_LIST+=("$value")
+    fi
+  done
+}
+
 GPU_LOG_OUT="${GPU_LOG_OUT:-/scratch/l/luislara/EcoPerceiver/logs/run_multi_gpu.out}"
 GPU_LOG_ERR="${GPU_LOG_ERR:-/scratch/l/luislara/EcoPerceiver/logs/run_multi_gpu.error}"
 
@@ -81,6 +91,11 @@ if [[ -n "$PREDICTION_TARGETS_ENV" ]]; then
 fi
 PREDICTION_TARGETS_VALUE="${PREDICTION_TARGET_LIST[*]}"
 export PREDICTION_TARGETS="$PREDICTION_TARGETS_VALUE"
+MERGE_PREDICTION_TARGETS_ENV="${MERGE_PREDICTION_TARGETS:-pred_GPP_DT pred_RECO_DT pred_FCH4 pred_LE}"
+MERGE_PREDICTION_TARGET_LIST=()
+append_merge_prediction_targets "$MERGE_PREDICTION_TARGETS_ENV"
+MERGE_PREDICTION_TARGETS_VALUE="${MERGE_PREDICTION_TARGET_LIST[*]}"
+export MERGE_PREDICTION_TARGETS="$MERGE_PREDICTION_TARGETS_VALUE"
 
 BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-32768}"
 NUM_WORKERS_PER_GPU="${NUM_WORKERS_PER_GPU:-12}"
@@ -119,11 +134,12 @@ echo "Dataloader workers per GPU: $NUM_WORKERS_PER_GPU"
 echo "Prefetch factor: $PREFETCH_FACTOR"
 echo "Dataloader in-order delivery: $DATALOADER_IN_ORDER_LABEL"
 echo "Prediction targets: $PREDICTION_TARGETS_VALUE"
+echo "Merge prediction targets: $MERGE_PREDICTION_TARGETS_VALUE"
 echo "Temporary shard order key: __sample_order (dropped during post-processing)"
 echo "Distributed timeout minutes: $DIST_TIMEOUT_MINUTES"
 
 torchrun --standalone --nnodes=1 --nproc-per-node=4 \
-  eval/test_era5_multi_gpu.py \
+  eval/era5/test_era5_multi_gpu.py \
   --run-path "$RUN_PATH" \
   --checkpoint-path "$CHECKPOINT_PATH" \
   --db-path "$DB_PATH" \
@@ -159,7 +175,7 @@ esac
 
 mkdir -p "$LOG_DIR"
 POST_JOB_ID="$(
-  sbatch --parsable \
+  PREDICTION_TARGETS="$MERGE_PREDICTION_TARGETS_VALUE" sbatch --parsable \
     --job-name "merge-shards-${DATE_TAG}" \
     --output "$LOG_DIR/merge_prediction_shards_${DATE_TAG}.out" \
     --error "$LOG_DIR/merge_prediction_shards_${DATE_TAG}.error" \

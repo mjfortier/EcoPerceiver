@@ -21,8 +21,8 @@ from ecoperceiver.constants import (
 
 # ======================== Paths and Table Names ========================
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_PATH = BASE_DIR.parent / 'experiments/data'
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DATA_PATH = REPO_ROOT / 'experiments/data'
 ERA5_DATA_PATH = DATA_PATH / 'era5_data'
 DB_SCHEMA_PATH = DATA_PATH / 'carbonpipeline_db_struct.sql'
 IGBP_PATH = DATA_PATH / 'igbp.tiff'

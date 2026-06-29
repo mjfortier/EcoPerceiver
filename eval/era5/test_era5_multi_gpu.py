@@ -3,17 +3,22 @@ import csv
 import math
 import os
 import shutil
+import sys
 from datetime import timedelta
 from pathlib import Path
 
-from test_era5 import (
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from eval.era5.test_era5 import (
     build_date_filter,
     normalize_predictor_value,
     parse_requested_prediction_targets,
     resolve_prediction_target_indices,
     zero_low_solar_gpp_predictions,
 )
-from utils import resolve_checkpoint_path, resolve_config_path
+from eval.utils import resolve_checkpoint_path, resolve_config_path
 
 INTERNAL_ORDER_COLUMN = "__sample_order"
 
@@ -93,8 +98,8 @@ def parse_args():
         "--skip-merge",
         action="store_true",
         help=(
-            "Only write per-rank shard CSVs. Use eval/merge_era5_shards.py "
-            "or scripts/post_era5.sh to merge them later."
+            "Only write per-rank shard CSVs. Use eval/era5/merge_era5_shards.py "
+            "or scripts/era5/merge_prediction_shards.sh to merge them later."
         ),
     )
     parser.add_argument(
@@ -359,7 +364,7 @@ def prepare_shard_dir(shard_dir: Path, *, rank: int, distributed: bool, device):
 
 
 def merge_csv_shards(shard_paths: list[Path], output_csv_path: Path):
-    from merge_era5_shards import merge_csv_shards as merge_post_csv_shards
+    from eval.era5.merge_era5_shards import merge_csv_shards as merge_post_csv_shards
 
     merge_post_csv_shards(
         shard_paths,
@@ -442,7 +447,7 @@ def main():
     from ecoperceiver.era5_dataset import ERA5Dataset
     from ecoperceiver.era5_model import ERA5EcoPerceiver
 
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = REPO_ROOT
     run_path = args.run_path.resolve()
     config_path = resolve_config_path(run_path, args.config_path)
     explicit_checkpoint_path = args.checkpoint_path.expanduser() if args.checkpoint_path is not None else None

@@ -1,9 +1,15 @@
 import argparse
 import csv
 import math
+import sys
 from datetime import datetime, time
 from pathlib import Path
-from utils import resolve_checkpoint_path, resolve_config_path, resolve_device
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from eval.utils import resolve_checkpoint_path, resolve_config_path, resolve_device
 
 DATE_ONLY_FORMATS = ("%Y-%m-%d", "%Y%m%d")
 DATETIME_FORMATS = (
@@ -296,7 +302,7 @@ def main():
     from ecoperceiver.components import EcoPerceiverConfig
     from ecoperceiver.era5_model import ERA5EcoPerceiver
 
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = REPO_ROOT
     run_path = args.run_path.resolve()
     config_path = resolve_config_path(run_path, args.config_path)
     explicit_checkpoint_path = args.checkpoint_path.expanduser() if args.checkpoint_path is not None else None

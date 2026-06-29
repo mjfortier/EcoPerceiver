@@ -512,7 +512,7 @@ def build_era5_cube_dataset(df, output_columns, num_shards, duplicate_policy, np
     dataset.attrs["source"] = "EcoPerceiver ERA5 torchrun inference shards"
     dataset.attrs["history"] = (
         f"{datetime.now(timezone.utc).isoformat()} EcoPerceiver predictions "
-        "converted to ERA5-like NetCDF via eval/merge_era5_shards.py"
+        "converted to ERA5-like NetCDF via eval/era5/merge_era5_shards.py"
     )
     dataset.attrs["num_shards"] = num_shards
     dataset.attrs["num_input_rows"] = input_row_count
