@@ -27,6 +27,7 @@ done
   exit 2
 }
 cd "$REPO_ROOT"
+SCRIPT_DIR="$REPO_ROOT/scripts/era5"
 
 if [[ -f "$REPO_ROOT/.env" ]]; then
   set -a
