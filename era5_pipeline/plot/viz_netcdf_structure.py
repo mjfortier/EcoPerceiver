@@ -9,14 +9,14 @@ from pathlib import Path
 from typing import Any
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-PREFERRED_DIM_ORDER = ("time", "latitude", "longitude", "sample")
-ERA5_CUBE_DIMS = ("time", "latitude", "longitude")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ERA5_CUBE_DIMS = ("valid_time", "latitude", "longitude")
+PREFERRED_DIM_ORDER = ("valid_time", "latitude", "longitude", "sample")
 DEFAULT_NETCDF_PATH = (
     REPO_ROOT
     / "experiments/runs"
     / "final_v2_3e-06_ws_l128_f12_e32_c32_o0.3_wcswcswcswcsssss_CC"
-    / "seed_0/eval/era5_predictions_20170601_to_20170630.nc"
+    / "seed_0/eval/era5_predictions_2017.nc"
 )
 
 
@@ -116,7 +116,13 @@ def dims_text(dims: tuple[str, ...]) -> str:
 
 
 def is_era5_cube(ds: Any) -> bool:
-    return all(name in ds.sizes for name in ERA5_CUBE_DIMS)
+    return era5_cube_dims(ds) is not None
+
+
+def era5_cube_dims(ds: Any) -> tuple[str, str, str] | None:
+    if all(name in ds.sizes for name in ERA5_CUBE_DIMS):
+        return ERA5_CUBE_DIMS
+    return None
 
 
 def print_era5_summary(ds: Any) -> None:
@@ -125,21 +131,24 @@ def print_era5_summary(ds: Any) -> None:
         return
 
     if not is_era5_cube(ds):
-        print("era5 layout: not a time/latitude/longitude cube")
+        print("era5 layout: not a valid_time/latitude/longitude cube")
         return
 
-    total_cells = ds.sizes["time"] * ds.sizes["latitude"] * ds.sizes["longitude"]
+    cube_dims = era5_cube_dims(ds)
+    assert cube_dims is not None
+    time_dim, lat_dim, lon_dim = cube_dims
+    total_cells = ds.sizes[time_dim] * ds.sizes[lat_dim] * ds.sizes[lon_dim]
     print("era5 layout: cube")
     print(
         "  grid: "
-        f"time={ds.sizes['time']} latitude={ds.sizes['latitude']} "
-        f"longitude={ds.sizes['longitude']} cells={total_cells}"
+        f"{time_dim}={ds.sizes[time_dim]} {lat_dim}={ds.sizes[lat_dim]} "
+        f"{lon_dim}={ds.sizes[lon_dim]} cells={total_cells}"
     )
 
     prediction_vars = [
         name
         for name, var in ds.data_vars.items()
-        if name.startswith("pred_") and var.dims == ERA5_CUBE_DIMS
+        if name.startswith("pred_") and var.dims == cube_dims
     ]
     print(
         "  prediction variables: "
@@ -153,8 +162,8 @@ def print_era5_summary(ds: Any) -> None:
     igbp_dims = ds["igbp"].dims
     if igbp_dims == ("latitude", "longitude"):
         print("  igbp: static per grid cell, dims=(latitude, longitude)")
-    elif igbp_dims == ERA5_CUBE_DIMS:
-        print("  igbp: time-varying, dims=(time, latitude, longitude)")
+    elif igbp_dims == cube_dims:
+        print(f"  igbp: time-varying, dims=({dims_text(cube_dims)})")
     else:
         print(f"  igbp: unexpected dims=({dims_text(igbp_dims)})")
 

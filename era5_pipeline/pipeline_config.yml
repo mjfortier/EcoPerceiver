@@ -1,0 +1,115 @@
+pipeline:
+  steps:
+    - download_era5
+    # - process_era5
+    # - download_modis
+    # - index_era5
+    # - assign_igbp_from_modis
+    # - process_modis
+  dry_run: false
+  python: null
+
+# start_date: "2016-01-01"
+# end_date: "2017-12-31"
+# start_date: "2014-01-01"
+# end_date: "2015-12-31"
+start_date: "2012-01-01"
+end_date: "2013-12-31"
+
+paths:
+  data_root: /home/l/luislara/links/projects/aip-pal/luislara/ep/data
+  lsm_path: experiments/data/lsm.nc
+
+download_era5:
+  enabled: true
+  dataset: reanalysis-era5-single-levels
+  product_type: reanalysis
+  data_format: netcdf
+  download_format: zip
+  # ERA5/CDS area order is north, west, south, east.
+  bbox: [90, -180, -90, 180]
+  temporal_chunk: monthly
+  max_workers: 4
+  latitude_band_degrees: 30
+  overwrite: false
+  variables:
+    - 10m_u_component_of_wind
+    - 10m_v_component_of_wind
+    - 2m_dewpoint_temperature
+    - 2m_temperature
+    - surface_pressure
+    - total_precipitation
+    - mean_surface_downward_long_wave_radiation_flux
+    - mean_surface_downward_short_wave_radiation_flux
+    - mean_surface_downward_short_wave_radiation_flux_clear_sky
+    - mean_surface_net_long_wave_radiation_flux
+    - mean_surface_latent_heat_flux
+    - mean_surface_sensible_heat_flux
+    - soil_temperature_level_1
+    - soil_temperature_level_2
+    - soil_temperature_level_3
+    - volumetric_soil_water_layer_1
+    - volumetric_soil_water_layer_2
+    - volumetric_soil_water_layer_3
+    - forecast_albedo
+    - friction_velocity
+    - geopotential
+
+process_era5:
+  recreate_db: true
+  batch_size: 100000
+  insert_hours_per_batch: 24
+  xarray_engine: h5netcdf
+  sqlite_threads: 8
+
+  timezone:
+    enabled: true
+    # "local" stores wall-clock timestamps per coordinate. The hourly grid keeps
+    # all coordinates on YYYYMMDDHH0000 values while TOD/DOY use exact offsets.
+    timestamp_policy: local
+    timestamp_grid: hourly
+    method: timezonefinder
+    require_timezonefinder: true
+    fallback: longitude_quarter_hour
+    local_window:
+      enabled: true
+
+  land_sea_mask:
+    enabled: true
+    threshold: 0.5
+    include_land_neighbors: true
+    allow_missing: false
+
+index_era5:
+  table: ec_data
+  index_name: idx_ec_data_coord_id_timestamp_id
+  columns:
+    - coord_id
+    - timestamp
+    - id
+  journal_mode: DELETE
+  skip_preflight: false
+  progress: none
+  threads: 8
+  analyze: true
+  dry_run: false
+
+download_modis:
+  products: null
+  max_workers: 8
+  overwrite: false
+  authenticate: false
+
+assign_igbp_from_modis:
+  modis_path: 201701011200C1.tiff
+  table: coord_data
+  only_null: false
+  write: true
+  batch_size: 10000
+
+process_modis:
+  dates: []
+  limit_dates: null
+  example_count: 10
+  overwrite: false
+  active_ec_coords_only: false

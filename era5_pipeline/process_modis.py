@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Transform raw global MODIS rasters into 9x8x8 arrays per 0.25 degree cell.
+"""Process raw global MODIS rasters into 9x8x8 arrays per 0.25 degree cell.
 
 This script follows the cleaning logic used in CarbonSense/EcoPerceiver stage 3:
 
@@ -15,7 +15,7 @@ Unlike the original site-level stage 3 pipeline, this script does not crop
 pixels `[1:9, 1:9]`. It chunks the full global rasters directly into the
 720 x 1440 ERA5-style grid, yielding one 9 x 8 x 8 tensor per cell.
 
-Each transformed cell is inserted into `modis_data(coord_id, modis_date, data)`
+Each processed cell is inserted into `modis_data(coord_id, modis_date, data)`
 in the target SQLite database.
 """
 
@@ -48,7 +48,7 @@ try:
 except ModuleNotFoundError:
     tqdm = None
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_INPUT_DIR = REPO_ROOT / "experiments" / "data" / "raw_modis"
 DEFAULT_DB_PATH = Path("/home/l/luislara/links/projects/aip-pal/luislara/ep/data/era5.db")
 CELL_SIZE_DEGREES = 0.25
@@ -172,7 +172,7 @@ def ensure_dependencies() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Transform paired raw MODIS A4/A2 GeoTIFFs into one 9x8x8 tensor "
+            "Process paired raw MODIS A4/A2 GeoTIFFs into one 9x8x8 tensor "
             "per 0.25 degree grid cell and insert them into SQLite."
         )
     )
@@ -196,7 +196,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help=(
-            "Specific timestamp(s) to transform, e.g. 201712031200. "
+            "Specific timestamp(s) to process, e.g. 201712031200. "
             "Repeat for multiple dates."
         ),
     )
@@ -210,7 +210,7 @@ def parse_args() -> argparse.Namespace:
         "--example-count",
         type=int,
         default=10,
-        help="Number of random transformed example cells to print. Default: 10.",
+        help="Number of random processed example cells to print. Default: 10.",
     )
     parser.add_argument(
         "--overwrite",
@@ -351,7 +351,7 @@ def load_coord_lookup(
         if not index_has_leading_column(conn, table="ec_data", column="coord_id"):
             raise RuntimeError(
                 "`--active-ec-coords-only` requires an ec_data index whose first "
-                "column is coord_id. Run `scripts/modis/index_era5.py` first to "
+                "column is coord_id. Run the index_era5 pipeline step first to "
                 "create idx_ec_data_coord_id_timestamp_id, or pass "
                 "`--no-active-ec-coords-only`."
             )
@@ -643,7 +643,7 @@ def main() -> int:
 
     print(
         f"Found {len(pairs)} paired timestamp(s) in {args.input_dir}. "
-        f"Transforming into {EXPECTED_GRID_HEIGHT}x{EXPECTED_GRID_WIDTH} cells "
+        f"Processing into {EXPECTED_GRID_HEIGHT}x{EXPECTED_GRID_WIDTH} cells "
         f"of shape 9x8x8.",
         flush=True,
     )
@@ -674,7 +674,7 @@ def main() -> int:
             progress = tqdm(
                 pairs,
                 total=len(pairs),
-                desc="transform_modis",
+                desc="process_modis",
                 unit="date",
                 dynamic_ncols=True,
                 file=sys.stdout,
@@ -700,7 +700,7 @@ def main() -> int:
                 )
             else:
                 print(
-                    f"transform_modis: {date_index}/{len(pairs)} date "
+                    f"process_modis: {date_index}/{len(pairs)} date "
                     f"timestamp={pair.timestamp} matched={stats.matched_coords} "
                     f"wrote={stats.inserted_or_updated_rows}",
                     flush=True,

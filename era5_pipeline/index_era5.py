@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Create persistent SQLite indexes for ERA5 evaluation."""
+"""Create persistent SQLite indexes for evaluation and MODIS lookup."""
 
 from __future__ import annotations
 
 import argparse
 from contextlib import closing, contextmanager
 import os
+from pathlib import Path
 import shutil
 import sqlite3
 import sys
 import time
-from pathlib import Path
 from urllib.parse import quote
 
 try:
@@ -19,12 +19,12 @@ except ModuleNotFoundError:
     tqdm = None
 
 
-DEFAULT_DB_PATH = Path("/home/l/luislara/links/projects/aip-pal/luislara/ep/data/era5.db")
+DEFAULT_DB_PATH = Path("experiments/data/era5.db")
 DEFAULT_TABLE = "ec_data"
 DEFAULT_INDEX_NAME = "idx_ec_data_coord_id_timestamp_id"
 DEFAULT_INDEX_COLUMNS = ("coord_id", "timestamp", "id")
-SQLITE_PROGRESS_OPCODES = 100_000
-HEARTBEAT_SECONDS = 15.0
+SQLITE_PROGRESS_OPCODES = 10_000_000
+HEARTBEAT_SECONDS = 60.0
 PROGRESS_STATUS_SECONDS = 2.0
 SQLITE_TIMEOUT_SECONDS = 60.0
 ESTIMATED_INDEX_BYTES_PER_ROW = 32.0
@@ -235,6 +235,13 @@ def sqlite_progress(
         temp_dir=temp_dir,
         progress_mode=progress_mode,
     )
+    if progress.progress_mode == "none":
+        try:
+            yield
+        finally:
+            progress.close()
+        return
+
     conn.set_progress_handler(progress.update, SQLITE_PROGRESS_OPCODES)
     try:
         yield
@@ -242,10 +249,11 @@ def sqlite_progress(
         conn.set_progress_handler(None, 0)
         progress.close()
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Create the composite ec_data index used by ERA5 eval startup and "
+            "Create the composite ec_data index used by eval startup and "
             "active MODIS coordinate lookup."
         )
     )
@@ -278,7 +286,7 @@ def parse_args() -> argparse.Namespace:
         "--analyze",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Run ANALYZE after index changes so SQLite picks the new index. Default: true.",
+        help="Run ANALYZE after index changes so SQLite picks the new index.",
     )
     parser.add_argument(
         "--dry-run",
@@ -411,9 +419,7 @@ def table_row_estimate(conn: sqlite3.Connection, table: str) -> int:
             return int(row[0])
 
     try:
-        row = conn.execute(
-            f"SELECT MAX(rowid) FROM {quote_identifier(table)}"
-        ).fetchone()
+        row = conn.execute(f"SELECT MAX(rowid) FROM {quote_identifier(table)}").fetchone()
     except sqlite3.Error as exc:
         raise RuntimeError(
             f"Cannot cheaply estimate row count for {table!r}; "

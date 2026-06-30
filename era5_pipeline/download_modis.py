@@ -48,17 +48,14 @@ except ModuleNotFoundError:
     tqdm = None
 
 HIGH_VOLUME_URL = "https://earthengine-highvolume.googleapis.com"
-REPO_ROOT = Path(__file__).resolve().parents[2]
-# DEFAULT_OUTPUT_DIR = REPO_ROOT / "experiments" / "data" / "raw_modis"
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "experiments" / "data" / "test_raw_modis"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "experiments" / "data" / "raw_modis"
 DEFAULT_PROJECT = "modis-488716"
-# DEFAULT_START_DATE = date(2016, 12, 31)
-# DEFAULT_END_DATE = date(2018, 1, 1)
-DEFAULT_START_DATE = date(2010, 6, 1)
-DEFAULT_END_DATE = date(2010, 6, 2)
+DEFAULT_START_DATE = date(2016, 1, 1)
+DEFAULT_END_DATE = date(2017, 12, 31)
 DEFAULT_TARGET_SCALE = 1 / 32
 DEFAULT_TILE_SIZE_DEG = 30
-DEFAULT_MAX_WORKERS = 64
+DEFAULT_MAX_WORKERS = 8
 
 
 @dataclass(frozen=True)
@@ -135,7 +132,8 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Download global MODIS rasters for an inclusive date range. "
             "Annual C1 land-cover files are downloaded once per year touched "
-            "by the requested range. Defaults to 2016-12-31 through 2018-01-01."
+            f"by the requested range. Defaults to {DEFAULT_START_DATE.isoformat()} "
+            f"through {DEFAULT_END_DATE.isoformat()}."
         )
     )
     parser.add_argument(
