@@ -12,8 +12,23 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT=""
+for candidate in "$PWD" "${SLURM_SUBMIT_DIR:-}" "${SLURM_SUBMIT_DIR:+$SLURM_SUBMIT_DIR/../..}" "$SCRIPT_DIR/../.."; do
+  [[ -n "$candidate" ]] || continue
+  candidate="$(cd "$candidate" 2>/dev/null && pwd)" || continue
+  if [[ -f "$candidate/setup.py" && -d "$candidate/scripts/era5" ]]; then
+    REPO_ROOT="$candidate"
+    break
+  fi
+done
+[[ -n "$REPO_ROOT" ]] || {
+  echo "Could not locate EcoPerceiver repo root." >&2
+  exit 2
+}
+
 source "$SCRATCH/env/ecoperceiver/bin/activate"
-cd ~/links/scratch/EcoPerceiver
+cd "$REPO_ROOT"
 
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
@@ -24,16 +39,6 @@ append_prediction_targets() {
   for value in $raw; do
     if [[ -n "$value" ]]; then
       PREDICTION_TARGET_LIST+=("$value")
-    fi
-  done
-}
-
-append_merge_prediction_targets() {
-  local raw value
-  raw="${1//,/ }"
-  for value in $raw; do
-    if [[ -n "$value" ]]; then
-      MERGE_PREDICTION_TARGET_LIST+=("$value")
     fi
   done
 }
@@ -79,9 +84,7 @@ if [[ -z "$DB_PATH" ]]; then
   DB_PATH="${DATA_ROOT}/${DB_LABEL}/era5_${DB_LABEL}.db"
 fi
 DATE_TAG="${INITIAL_DATE//-/}_to_${FINAL_DATE//-/}"
-OUTPUT_CSV="${OUTPUT_CSV:-$RUN_PATH/eval/era5_predictions_${DATE_TAG}.csv}"
 SHARD_DIR="${SHARD_DIR:-$RUN_PATH/eval/.era5_predictions_${DATE_TAG}_multi_gpu_shards}"
-LOG_DIR="${LOG_DIR:-/scratch/l/luislara/EcoPerceiver/logs}"
 IGBP_EXCLUDED=(WAT SNO BSV URB CRO CVM)
 PREDICTION_TARGETS_ENV="${PREDICTION_TARGETS:-pred_NEE pred_GPP_DT pred_RECO_DT pred_FCH4 pred_LE}"
 PREDICTION_TARGET_LIST=(pred_NEE pred_GPP_DT pred_RECO_DT pred_FCH4 pred_LE)
@@ -91,11 +94,6 @@ if [[ -n "$PREDICTION_TARGETS_ENV" ]]; then
 fi
 PREDICTION_TARGETS_VALUE="${PREDICTION_TARGET_LIST[*]}"
 export PREDICTION_TARGETS="$PREDICTION_TARGETS_VALUE"
-MERGE_PREDICTION_TARGETS_ENV="${MERGE_PREDICTION_TARGETS:-pred_GPP_DT pred_RECO_DT pred_FCH4 pred_LE}"
-MERGE_PREDICTION_TARGET_LIST=()
-append_merge_prediction_targets "$MERGE_PREDICTION_TARGETS_ENV"
-MERGE_PREDICTION_TARGETS_VALUE="${MERGE_PREDICTION_TARGET_LIST[*]}"
-export MERGE_PREDICTION_TARGETS="$MERGE_PREDICTION_TARGETS_VALUE"
 
 BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-32768}"
 NUM_WORKERS_PER_GPU="${NUM_WORKERS_PER_GPU:-12}"
@@ -126,7 +124,6 @@ fi
 echo "Date window: $INITIAL_DATE to $FINAL_DATE"
 echo "DB path: $DB_PATH"
 echo "Checkpoint path: $CHECKPOINT_PATH"
-echo "Output CSV: $OUTPUT_CSV"
 echo "Shard dir: $SHARD_DIR"
 echo "GPUs: 4"
 echo "Batch size per GPU: $BATCH_SIZE_PER_GPU"
@@ -134,8 +131,7 @@ echo "Dataloader workers per GPU: $NUM_WORKERS_PER_GPU"
 echo "Prefetch factor: $PREFETCH_FACTOR"
 echo "Dataloader in-order delivery: $DATALOADER_IN_ORDER_LABEL"
 echo "Prediction targets: $PREDICTION_TARGETS_VALUE"
-echo "Merge prediction targets: $MERGE_PREDICTION_TARGETS_VALUE"
-echo "Temporary shard order key: __sample_order (dropped during post-processing)"
+echo "Temporary shard order key: __sample_order"
 echo "Distributed timeout minutes: $DIST_TIMEOUT_MINUTES"
 
 torchrun --standalone --nnodes=1 --nproc-per-node=4 \
@@ -145,7 +141,6 @@ torchrun --standalone --nnodes=1 --nproc-per-node=4 \
   --db-path "$DB_PATH" \
   --initial-date "$INITIAL_DATE" \
   --final-date "$FINAL_DATE" \
-  --output-csv "$OUTPUT_CSV" \
   --shard-dir "$SHARD_DIR" \
   --batch-size "$BATCH_SIZE_PER_GPU" \
   --num-workers "$NUM_WORKERS_PER_GPU" \
@@ -154,32 +149,7 @@ torchrun --standalone --nnodes=1 --nproc-per-node=4 \
   "${DATALOADER_ORDER_ARGS[@]}" \
   --exclude-igbp "${IGBP_EXCLUDED[@]}" \
   --prediction-targets "${PREDICTION_TARGET_LIST[@]}" \
-  --gpp-solar-threshold 2.0 \
-  --skip-merge
+  --gpp-solar-threshold 2.0
   # --max-samples 1000000 \
 
-echo "[$(date)] GPU inference shards complete. Submitting scripts/era5/merge_prediction_shards.sh on CPU."
-POST_FORMAT="${POST_FORMAT:-csv}"
-case "$POST_FORMAT" in
-  csv)
-    POST_OUTPUT_PATH="${OUTPUT_PATH:-$OUTPUT_CSV}"
-    ;;
-  netcdf)
-    POST_OUTPUT_PATH="${OUTPUT_PATH:-$RUN_PATH/eval/era5_predictions_${DATE_TAG}.nc}"
-    ;;
-  *)
-    echo "POST_FORMAT must be csv or netcdf, got: $POST_FORMAT" >&2
-    exit 2
-    ;;
-esac
-
-mkdir -p "$LOG_DIR"
-POST_JOB_ID="$(
-  PREDICTION_TARGETS="$MERGE_PREDICTION_TARGETS_VALUE" sbatch --parsable \
-    --job-name "merge-shards-${DATE_TAG}" \
-    --output "$LOG_DIR/merge_prediction_shards_${DATE_TAG}.out" \
-    --error "$LOG_DIR/merge_prediction_shards_${DATE_TAG}.error" \
-    --export=ALL,RUN_PATH="$RUN_PATH",INITIAL_DATE="$INITIAL_DATE",FINAL_DATE="$FINAL_DATE",POST_FORMAT="$POST_FORMAT",SHARD_DIR="$SHARD_DIR",OUTPUT_PATH="$POST_OUTPUT_PATH" \
-    scripts/era5/merge_prediction_shards.sh
-)"
-echo "[$(date)] Submitted ERA5 CPU post-processing job: $POST_JOB_ID (format: $POST_FORMAT, output: $POST_OUTPUT_PATH)"
+echo "[$(date)] GPU inference shards complete."

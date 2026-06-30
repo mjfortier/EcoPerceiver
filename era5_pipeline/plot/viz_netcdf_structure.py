@@ -9,14 +9,14 @@ from pathlib import Path
 from typing import Any
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 ERA5_CUBE_DIMS = ("valid_time", "latitude", "longitude")
 PREFERRED_DIM_ORDER = ("valid_time", "latitude", "longitude", "sample")
 DEFAULT_NETCDF_PATH = (
     REPO_ROOT
     / "experiments/runs"
     / "final_v2_3e-06_ws_l128_f12_e32_c32_o0.3_wcswcswcswcsssss_CC"
-    / "seed_0/eval/era5_predictions_20170601_to_20170630.nc"
+    / "seed_0/eval/era5_predictions_2017.nc"
 )
 
 

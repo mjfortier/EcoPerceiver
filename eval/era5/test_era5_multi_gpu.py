@@ -48,7 +48,7 @@ class IndexedERA5Collate:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run distributed ERA5 inference with torchrun and save predictions to CSV."
+        description="Run distributed ERA5 inference with torchrun and write rank CSV shards."
     )
     parser.add_argument(
         "--run-path",
@@ -72,34 +72,12 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--output-csv",
-        type=Path,
-        default=None,
-        help=(
-            "Output CSV path. Default is <run_path>/eval/era5_predictions_multi_gpu.csv, "
-            "or era5_predictions_<start>_to_<end>_multi_gpu.csv when date bounds are provided."
-        ),
-    )
-    parser.add_argument(
         "--shard-dir",
         type=Path,
         default=None,
         help=(
-            "Directory for per-rank temporary CSV shards "
-            "(default: <output_dir>/.<output_name>_shards)."
-        ),
-    )
-    parser.add_argument(
-        "--keep-shards",
-        action="store_true",
-        help="Keep per-rank shard CSVs after rank 0 merges them.",
-    )
-    parser.add_argument(
-        "--skip-merge",
-        action="store_true",
-        help=(
-            "Only write per-rank shard CSVs. Use eval/era5/merge_era5_shards.py "
-            "or scripts/era5/merge_prediction_shards.sh to merge them later."
+            "Directory for per-rank CSV shards "
+            "(default: <run_path>/eval/.era5_predictions_<date-range>_multi_gpu_shards)."
         ),
     )
     parser.add_argument(
@@ -173,7 +151,7 @@ def parse_args():
         default=None,
         metavar="TARGET",
         help=(
-            "Prediction target columns to include in the output CSV. Accepts "
+            "Prediction target columns to include in the output shards. Accepts "
             "comma-separated or space-separated values, with or without the "
             "pred_ prefix. Default: all model outputs."
         ),
@@ -245,11 +223,11 @@ def barrier(distributed: bool, device=None):
             dist.barrier()
 
 
-def default_output_csv_path(run_path: Path, date_tag: str | None) -> Path:
+def default_shard_dir_path(run_path: Path, date_tag: str | None) -> Path:
     filename = (
-        "era5_predictions_multi_gpu.csv"
+        ".era5_predictions_multi_gpu_shards"
         if date_tag is None
-        else f"era5_predictions_{date_tag}_multi_gpu.csv"
+        else f".era5_predictions_{date_tag}_multi_gpu_shards"
     )
     return run_path / "eval" / filename
 
@@ -363,18 +341,6 @@ def prepare_shard_dir(shard_dir: Path, *, rank: int, distributed: bool, device):
     barrier(distributed, device)
 
 
-def merge_csv_shards(shard_paths: list[Path], output_csv_path: Path):
-    from eval.era5.merge_era5_shards import merge_csv_shards as merge_post_csv_shards
-
-    merge_post_csv_shards(
-        shard_paths,
-        output_csv_path,
-        prediction_targets=None,
-        sort_output=True,
-        sort_tmp_dir=None,
-    )
-
-
 def move_batch_to_device(batch, device):
     batch.predictor_values = batch.predictor_values.to(device, non_blocking=True)
     batch.aux_values = batch.aux_values.to(device, non_blocking=True)
@@ -458,19 +424,14 @@ def main():
     db_path = args.db_path.expanduser().resolve()
     if not db_path.exists():
         raise FileNotFoundError(f"SQLite database not found: {db_path}")
-    output_csv_path = (
-        default_output_csv_path(run_path, date_tag)
-        if args.output_csv is None
-        else args.output_csv.resolve()
-    )
     shard_dir = (
         args.shard_dir.expanduser().resolve()
         if args.shard_dir is not None
-        else output_csv_path.parent / f".{output_csv_path.stem}_shards"
+        else default_shard_dir_path(run_path, date_tag)
     )
 
     if rank == 0:
-        output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        shard_dir.parent.mkdir(parents=True, exist_ok=True)
     prepare_shard_dir(shard_dir, rank=rank, distributed=distributed, device=device)
 
     with config_path.open("r", encoding="utf-8") as f:
@@ -497,7 +458,6 @@ def main():
         print(f"Data path: {data_path}")
         print(f"DB path: {db_path}")
         print(f"Torchrun world size: {world_size}")
-        print(f"Output CSV: {output_csv_path}")
         print(f"Shard dir: {shard_dir}")
         if start_timestamp is not None or end_timestamp is not None:
             print(f"ERA5 date filter: {start_timestamp or 'start'} to {end_timestamp or 'end'}")
@@ -643,14 +603,6 @@ def main():
         flush=True,
     )
 
-    if args.skip_merge:
-        if rank == 0:
-            print(f"Skipped final merge. Rank shards are written under: {shard_dir}")
-            print(f"Merge later to: {output_csv_path}")
-        if distributed:
-            dist.destroy_process_group()
-        return
-
     stats_device = device if device.type == "cuda" else torch.device("cpu")
     stats = torch.tensor(
         [rows_written, batches_processed, low_solar_gpp_rows],
@@ -665,13 +617,10 @@ def main():
         int(stats[2].item()),
     )
 
-    barrier(distributed, device)
     if rank == 0:
-        shard_paths = [shard_dir / f"rank_{shard_rank:05d}.csv" for shard_rank in range(world_size)]
-        merge_csv_shards(shard_paths, output_csv_path)
         print(
-            f"Saved predictions for {total_rows_written} samples across "
-            f"{total_batches_processed} batches to: {output_csv_path}"
+            f"Saved rank shards for {total_rows_written} samples across "
+            f"{total_batches_processed} batches under: {shard_dir}"
         )
         if force_zero_gpp_low_solar:
             print(
@@ -679,8 +628,6 @@ def main():
                 f"raw final SW_IN < {args.gpp_solar_threshold:g} W m-2 "
                 f"(normalized SW_IN < {normalized_gpp_solar_threshold:.6g})"
             )
-        if not args.skip_merge and not args.keep_shards:
-            shutil.rmtree(shard_dir)
 
     barrier(distributed, device)
     if distributed:
